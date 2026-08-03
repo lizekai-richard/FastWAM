@@ -1,0 +1,742 @@
+{
+  "schema_version": "2.1",
+  "preset": "robotwin",
+  "num_views": 3,
+  "task": "robotwin_uncond_3cam_384_1e-4",
+  "checkpoint": "/lustre/fs11/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/fastwam/robotwin_uncond_3cam_384.pt",
+  "dataset_stats": "/lustre/fs11/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/fastwam/robotwin_uncond_3cam_384_dataset_stats.json",
+  "dataset_dir": "/lustre/fs11/portfolios/nvr/projects/nvr_elm_llm/users/zekail/data/robotwin2.0/robotwin2.0",
+  "dataset_loader": "base_lerobot",
+  "dataset_length": 63528,
+  "sample_start": 0,
+  "num_samples": 1,
+  "device": "cuda",
+  "mixed_precision": "bf16",
+  "include_text_encoder": false,
+  "context_source": "zero_dummy",
+  "num_inference_steps": 10,
+  "action_horizon": 32,
+  "num_video_frames": 9,
+  "input_image_shape": [
+    1,
+    3,
+    384,
+    320
+  ],
+  "warmup": 10,
+  "iters": 50,
+  "total_timed_calls": 50,
+  "torch_compile": {
+    "enabled": false,
+    "mode": null,
+    "dynamic": null,
+    "disable_cudagraphs": null,
+    "options": null,
+    "targets": []
+  },
+  "latency": {
+    "mean_ms": 483.7181209027767,
+    "min_ms": 482.4827299453318,
+    "max_ms": 485.974291106686,
+    "p50_ms": 483.6489054141566,
+    "p90_ms": 484.3491079285741,
+    "p95_ms": 484.5579623361118
+  },
+  "latency_breakdown": {
+    "enabled": true,
+    "execution_mode": "eager_instrumented",
+    "canonical_latency_execution_mode": "eager",
+    "same_execution_path_as_canonical_latency": true,
+    "measurement_note": "CUDA stages use events on the current stream with one synchronization at call end. Validation, action-noise initialization, and output D2H remain in canonical end-to-end latency but are intentionally excluded from the two-stage breakdown. When torch_compile is enabled, canonical latency is compiled but breakdown remains eager.",
+    "stage_definitions": {
+      "video_kv_prefill": "Image device transfer, VAE encoding, conditioning, video token/mask preparation, and the video transformer pass that materializes the KV cache",
+      "action_prediction": "Inference schedule construction plus the full iterative ActionDiT denoising loop, including scheduler updates; output D2H is excluded"
+    },
+    "warmup": 10,
+    "iters": 50,
+    "total_profiled_calls": 50,
+    "input_devices": {
+      "image": "cuda:0",
+      "proprio": "cuda:0",
+      "context": "cuda:0"
+    },
+    "clock": "cuda_event",
+    "device": "cuda",
+    "stages": {
+      "video_kv_prefill": {
+        "mean_ms": 52.21296081542969,
+        "min_ms": 51.86431884765625,
+        "max_ms": 53.80339050292969,
+        "p50_ms": 52.19321632385254,
+        "p90_ms": 52.40895576477051,
+        "p95_ms": 52.648667907714845
+      },
+      "action_prediction": {
+        "mean_ms": 423.44570495605467,
+        "min_ms": 421.9540100097656,
+        "max_ms": 427.1999816894531,
+        "p50_ms": 423.31463623046875,
+        "p90_ms": 424.61524963378906,
+        "p95_ms": 424.8223419189453
+      }
+    },
+    "per_sample": [
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.02668762207031,
+          "action_prediction": 422.55426025390625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.95747375488281,
+          "action_prediction": 422.1998291015625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.18403244018555,
+          "action_prediction": 421.9540100097656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.959808349609375,
+          "action_prediction": 422.2030334472656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.0662727355957,
+          "action_prediction": 422.5076599121094
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.97177505493164,
+          "action_prediction": 422.4942626953125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.86431884765625,
+          "action_prediction": 424.8127746582031
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.30400085449219,
+          "action_prediction": 422.65325927734375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.241695404052734,
+          "action_prediction": 422.7939758300781
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.07497787475586,
+          "action_prediction": 422.4096374511719
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.05244827270508,
+          "action_prediction": 422.8984375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.94076919555664,
+          "action_prediction": 422.94677734375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.70364761352539,
+          "action_prediction": 424.2825622558594
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.36393737792969,
+          "action_prediction": 422.9129943847656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.03926467895508,
+          "action_prediction": 423.497314453125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.965023040771484,
+          "action_prediction": 423.67559814453125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.91059112548828,
+          "action_prediction": 423.6065368652344
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.3422737121582,
+          "action_prediction": 423.2298889160156
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.095680236816406,
+          "action_prediction": 423.50311279296875
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.08028793334961,
+          "action_prediction": 422.99652099609375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.065185546875,
+          "action_prediction": 422.4851379394531
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.8941764831543,
+          "action_prediction": 422.7718505859375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.310848236083984,
+          "action_prediction": 422.47467041015625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.11772918701172,
+          "action_prediction": 421.9969787597656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.206817626953125,
+          "action_prediction": 422.9874572753906
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.0425910949707,
+          "action_prediction": 422.9628601074219
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 51.92496109008789,
+          "action_prediction": 423.0334167480469
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.25312042236328,
+          "action_prediction": 422.865478515625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.20240020751953,
+          "action_prediction": 423.3754577636719
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.21571350097656,
+          "action_prediction": 424.5926208496094
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.217281341552734,
+          "action_prediction": 424.4745788574219
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.20588684082031,
+          "action_prediction": 423.2538146972656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.11590576171875,
+          "action_prediction": 423.6861267089844
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.029441833496094,
+          "action_prediction": 423.60931396484375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.21977615356445,
+          "action_prediction": 424.597900390625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.215423583984375,
+          "action_prediction": 424.2584228515625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.3988151550293,
+          "action_prediction": 423.78546142578125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.235904693603516,
+          "action_prediction": 424.7713928222656
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.067264556884766,
+          "action_prediction": 423.91949462890625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.399295806884766,
+          "action_prediction": 424.595703125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.722496032714844,
+          "action_prediction": 423.56201171875
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.405982971191406,
+          "action_prediction": 423.5042419433594
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.24534225463867,
+          "action_prediction": 425.0967712402344
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.3520622253418,
+          "action_prediction": 427.1999816894531
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 53.80339050292969,
+          "action_prediction": 424.8301696777344
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.43571090698242,
+          "action_prediction": 423.70562744140625
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.375328063964844,
+          "action_prediction": 423.95550537109375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.58147048950195,
+          "action_prediction": 423.50775146484375
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.129119873046875,
+          "action_prediction": 423.08868408203125
+        },
+        "sample_index": 0
+      },
+      {
+        "clock": "cuda_event",
+        "device": "cuda",
+        "stages_ms": {
+          "video_kv_prefill": 52.11363220214844,
+          "action_prediction": 423.20391845703125
+        },
+        "sample_index": 0
+      }
+    ]
+  },
+  "per_sample": [
+    {
+      "sample_index": 0,
+      "latency_ms": 483.25232113711536
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.3439241629094
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.0199549905956
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.15156903117895
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.6089799646288
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.59741014428437
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 482.8637910541147
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.0554351210594
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 482.87566006183624
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.0972661729902
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 482.4827299453318
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.46906597726047
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.3479030057788
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.33519301377237
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.46780613064766
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.1349439229816
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.95768902264535
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 482.91803197935224
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.16854797303677
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.1616149060428
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.12362702563405
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.56087878346443
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.3169321063906
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.6196999531239
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.34607894159853
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.9758789166808
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.2484610378742
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.600728912279
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.08804181963205
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.71953307650983
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.7036319077015
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.8530761189759
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.42200415208936
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 485.974291106686
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.15148397907615
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.60345885157585
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.2048748396337
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.8276959490031
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 485.0965382065624
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.8972969446331
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.39352004788816
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.7372221518308
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.1235331259668
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.37636881135404
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.2077649664134
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.2408748809248
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.6781108751893
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 483.714401954785
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.0976919513196
+    },
+    {
+      "sample_index": 0,
+      "latency_ms": 484.6925060264766
+    }
+  ],
+  "cuda_memory": {
+    "max_allocated_gb": 12.850490093231201,
+    "max_reserved_gb": 13.16796875
+  }
+}
