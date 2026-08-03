@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -7,10 +9,11 @@ class WanContinuousFlowMatchScheduler:
     def __init__(self, num_train_timesteps: int = 1000, shift: float = 5.0, eps: float = 1e-10):
         if num_train_timesteps <= 0:
             raise ValueError(f"`num_train_timesteps` must be positive, got {num_train_timesteps}")
-        if shift <= 0:
+        shift = float(shift)
+        if not math.isfinite(shift) or shift <= 0:
             raise ValueError(f"`shift` must be positive, got {shift}")
         self.num_train_timesteps = int(num_train_timesteps)
-        self.shift = float(shift)
+        self.shift = shift
         self.eps = float(eps)
         self._y_min, self._weight_norm_const = self._precompute_training_weight_stats()
 
@@ -70,7 +73,7 @@ class WanContinuousFlowMatchScheduler:
         if num_inference_steps <= 0:
             raise ValueError(f"`num_inference_steps` must be positive, got {num_inference_steps}")
         shift = self.shift if shift_override is None else float(shift_override)
-        if shift <= 0:
+        if not math.isfinite(shift) or shift <= 0:
             raise ValueError(f"`shift` must be positive, got {shift}")
 
         u_steps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device, dtype=torch.float32)
@@ -79,10 +82,72 @@ class WanContinuousFlowMatchScheduler:
         deltas = sigma_steps[1:] - sigma_steps[:-1]
         return timesteps.to(dtype=dtype), deltas.to(dtype=dtype)
 
+    def build_streaming_slot_schedule(
+        self,
+        num_slots: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        shift_override: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build one denoising timestep and delta for each streaming slot.
+
+        Slots are ordered from cleanest to noisiest, the opposite of the
+        sequential inference traversal.  The delta at each slot remains paired
+        with its timestep and advances that slot toward the next cleaner state.
+        """
+        timesteps, deltas = self.build_inference_schedule(
+            num_inference_steps=num_slots,
+            device=device,
+            dtype=dtype,
+            shift_override=shift_override,
+        )
+        return timesteps.flip(0), deltas.flip(0)
+
     @staticmethod
     def step(model_output: torch.Tensor, delta: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
         delta = delta.to(sample.device, dtype=sample.dtype)
         if delta.ndim == 0:
             return sample + model_output * delta
         delta = delta.view(-1, *([1] * (sample.ndim - 1)))
+        return sample + model_output * delta
+
+    @staticmethod
+    def step_per_token(
+        model_output: torch.Tensor,
+        delta_per_token: torch.Tensor,
+        sample: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply token-specific Euler deltas to samples shaped ``[B, T, ...]``."""
+        if sample.ndim < 2:
+            raise ValueError(
+                f"`sample` must have shape [B, T, ...], got {tuple(sample.shape)}"
+            )
+        if model_output.shape != sample.shape:
+            raise ValueError(
+                "`model_output` shape must match `sample`, "
+                f"got {tuple(model_output.shape)} vs {tuple(sample.shape)}"
+            )
+
+        batch_size, num_tokens = sample.shape[:2]
+        if delta_per_token.ndim == 1:
+            if delta_per_token.shape[0] != num_tokens:
+                raise ValueError(
+                    f"1D `delta_per_token` must have shape [T]=[{num_tokens}], "
+                    f"got {tuple(delta_per_token.shape)}"
+                )
+            delta_shape = (1, num_tokens) + (1,) * (sample.ndim - 2)
+        elif delta_per_token.ndim == 2:
+            if delta_per_token.shape != (batch_size, num_tokens):
+                raise ValueError(
+                    "2D `delta_per_token` must have shape [B, T]="
+                    f"[{batch_size}, {num_tokens}], got {tuple(delta_per_token.shape)}"
+                )
+            delta_shape = (batch_size, num_tokens) + (1,) * (sample.ndim - 2)
+        else:
+            raise ValueError(
+                "`delta_per_token` must have shape [T] or [B, T], "
+                f"got {tuple(delta_per_token.shape)}"
+            )
+
+        delta = delta_per_token.to(sample.device, dtype=sample.dtype).reshape(delta_shape)
         return sample + model_output * delta

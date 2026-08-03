@@ -1,3 +1,4 @@
+import math
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -11,6 +12,16 @@ from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .streaming_action import (
+    StreamingActionState,
+    append_cold_start_noise,
+    cold_start_token_values,
+    emit_shift_append_action_buffer,
+    initialize_streaming_action_state,
+    slot_block_causal_action_mask,
+    update_action_buffer,
+    validate_streaming_config,
+)
 
 logger = get_logger(__name__)
 
@@ -38,6 +49,13 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        streaming_action_enabled: bool = False,
+        streaming_action_num_slots: int = 8,
+        streaming_action_chunk_size: int = 4,
+        torch_compile_infer_action: bool = False,
+        torch_compile_mode: str = "max-autotune",
+        torch_compile_dynamic: Optional[bool] = True,
+        torch_compile_disable_cudagraphs: bool = True,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,8 +102,48 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.streaming_action_enabled = bool(streaming_action_enabled)
+        self.streaming_action_num_slots = int(streaming_action_num_slots)
+        self.streaming_action_chunk_size = int(streaming_action_chunk_size)
+        if self.streaming_action_enabled and type(self) is not FastWAM:
+            raise NotImplementedError(
+                "This integration currently supports base FastWAM only; "
+                f"{type(self).__name__} needs its own video/action streaming contract."
+            )
+        if self.streaming_action_num_slots <= 0:
+            raise ValueError(
+                "`streaming_action_num_slots` must be positive, "
+                f"got {self.streaming_action_num_slots}."
+            )
+        if self.streaming_action_chunk_size <= 0:
+            raise ValueError(
+                "`streaming_action_chunk_size` must be positive, "
+                f"got {self.streaming_action_chunk_size}."
+            )
+        if (
+            self.streaming_action_enabled
+            and float(self.train_action_scheduler.shift)
+            != float(self.infer_action_scheduler.shift)
+        ):
+            raise ValueError(
+                "Streaming action requires identical action train/infer shifts "
+                "so slot stages have one schedule contract, got "
+                f"train={self.train_action_scheduler.shift}, "
+                f"infer={self.infer_action_scheduler.shift}."
+            )
+        self.torch_compile_infer_action = bool(torch_compile_infer_action)
+        self.torch_compile_mode = str(torch_compile_mode)
+        self.torch_compile_dynamic = torch_compile_dynamic
+        self.torch_compile_disable_cudagraphs = bool(
+            torch_compile_disable_cudagraphs
+        )
+        self.torch_compile_options: Optional[dict[str, Any]] = None
+        self.torch_compile_targets: list[str] = []
+        self.loaded_checkpoint_streaming_action: Optional[dict[str, Any]] = None
 
         self.to(self.device)
+        if self.torch_compile_infer_action:
+            self._compile_infer_action_entrypoint()
 
     @classmethod
     def from_wan22_pretrained(
@@ -111,6 +169,13 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        streaming_action_enabled: bool = False,
+        streaming_action_num_slots: int = 8,
+        streaming_action_chunk_size: int = 4,
+        torch_compile_infer_action: bool = False,
+        torch_compile_mode: str = "max-autotune",
+        torch_compile_dynamic: Optional[bool] = True,
+        torch_compile_disable_cudagraphs: bool = True,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -166,8 +231,15 @@ class FastWAM(torch.nn.Module):
             action_train_shift=action_train_shift,
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
+            streaming_action_enabled=streaming_action_enabled,
+            streaming_action_num_slots=streaming_action_num_slots,
+            streaming_action_chunk_size=streaming_action_chunk_size,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            torch_compile_infer_action=torch_compile_infer_action,
+            torch_compile_mode=torch_compile_mode,
+            torch_compile_dynamic=torch_compile_dynamic,
+            torch_compile_disable_cudagraphs=torch_compile_disable_cudagraphs,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -186,7 +258,97 @@ class FastWAM(torch.nn.Module):
         if self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
         self.vae.to(*args, **kwargs)
+        # Canonicalize generic devices such as ``cuda`` to the concrete device
+        # selected by PyTorch (for example ``cuda:0``). Streaming state carries
+        # real tensors and should be checked against that resolved device.
+        try:
+            self.device = next(self.action_expert.parameters()).device
+        except StopIteration:
+            pass
         return self
+
+    def _move_tensor_tree_to_device(self, value: Any, device: torch.device) -> Any:
+        if torch.is_tensor(value):
+            return value.to(device=device)
+        if isinstance(value, tuple):
+            return tuple(
+                self._move_tensor_tree_to_device(item, device) for item in value
+            )
+        if isinstance(value, list):
+            return [self._move_tensor_tree_to_device(item, device) for item in value]
+        return value
+
+    def _prepare_compile_inputs(self) -> None:
+        for expert_name in ("video_expert", "action_expert"):
+            expert = getattr(self, expert_name, None)
+            if expert is not None and hasattr(expert, "freqs"):
+                expert.freqs = self._move_tensor_tree_to_device(
+                    expert.freqs, self.device
+                )
+
+    def _torch_compile_kwargs(self) -> dict[str, Any]:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("This PyTorch build does not provide torch.compile.")
+
+        kwargs: dict[str, Any] = {"dynamic": self.torch_compile_dynamic}
+        mode = self.torch_compile_mode
+        if self.torch_compile_disable_cudagraphs:
+            options: dict[str, Any] = {}
+            if mode:
+                list_mode_options = getattr(
+                    getattr(torch, "_inductor", None),
+                    "list_mode_options",
+                    None,
+                )
+                if list_mode_options is not None:
+                    options.update(
+                        list_mode_options(mode, dynamic=self.torch_compile_dynamic)
+                    )
+                elif mode == "max-autotune":
+                    options.update(
+                        {
+                            "max_autotune": True,
+                            "coordinate_descent_tuning": True,
+                        }
+                    )
+                else:
+                    raise RuntimeError(
+                        "torch.compile mode options are unavailable for "
+                        f"mode={mode!r} in this PyTorch build."
+                    )
+            options["triton.cudagraphs"] = False
+            options["triton.cudagraph_trees"] = False
+            self.torch_compile_options = dict(options)
+            kwargs["options"] = options
+        elif mode:
+            kwargs["mode"] = mode
+            self.torch_compile_options = None
+        return kwargs
+
+    def _compile_infer_action_entrypoint(self) -> None:
+        if self.streaming_action_enabled:
+            raise RuntimeError(
+                "`torch_compile_infer_action=true` is not supported for the "
+                "caller-stateful streaming API yet. Compiling the public method "
+                "would graph-break on Generator sampling and state transitions; "
+                "leave it disabled for honest streaming latency measurements."
+            )
+        self._prepare_compile_inputs()
+        method_name = "infer_action"
+        eager_method = getattr(self, method_name)
+        setattr(self, f"_{method_name}_eager", eager_method)
+        compiled_method = torch.compile(eager_method, **self._torch_compile_kwargs())
+        setattr(self, method_name, compiled_method)
+        target = f"{self.__class__.__name__}.{method_name}"
+        self.torch_compile_targets.append(target)
+        logger.info(
+            "Enabled torch.compile for %s with mode=%s dynamic=%s "
+            "disable_cudagraphs=%s.",
+            target,
+            self.torch_compile_mode,
+            self.torch_compile_dynamic,
+            self.torch_compile_disable_cudagraphs,
+        )
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -274,7 +436,12 @@ class FastWAM(torch.nn.Module):
             frames.append(Image.fromarray(frame))
         return frames
 
-    def build_inputs(self, sample, tiled: bool = False):
+    def build_inputs(
+        self,
+        sample,
+        tiled: bool = False,
+        first_frame_only: bool = False,
+    ):
         video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError(
@@ -335,6 +502,8 @@ class FastWAM(torch.nn.Module):
                 )
         
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        if first_frame_only:
+            input_video = input_video[:, :, :1]
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
         first_frame_latents = None
@@ -389,21 +558,47 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        action_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         total_seq_len = video_seq_len + action_seq_len
-        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        if action_attention_mask is None:
+            mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        else:
+            if action_attention_mask.ndim not in (2, 3):
+                raise ValueError(
+                    "`action_attention_mask` must be [Sa,Sa] or [B,Sa,Sa], "
+                    f"got {tuple(action_attention_mask.shape)}."
+                )
+            if action_attention_mask.shape[-2:] != (action_seq_len, action_seq_len):
+                raise ValueError(
+                    "`action_attention_mask` shape mismatch: expected trailing shape "
+                    f"({action_seq_len}, {action_seq_len}), got "
+                    f"{tuple(action_attention_mask.shape)}."
+                )
+            prefix_shape = action_attention_mask.shape[:-2]
+            mask = torch.zeros(
+                (*prefix_shape, total_seq_len, total_seq_len),
+                dtype=torch.bool,
+                device=device,
+            )
 
         # video -> video
-        mask[:video_seq_len, :video_seq_len] = self.video_expert.build_video_to_video_mask(
+        video_mask = self.video_expert.build_video_to_video_mask(
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
         )
+        mask[..., :video_seq_len, :video_seq_len] = video_mask
         # action -> action
-        mask[video_seq_len:, video_seq_len:] = True
+        if action_attention_mask is None:
+            mask[..., video_seq_len:, video_seq_len:] = True
+        else:
+            mask[..., video_seq_len:, video_seq_len:] = action_attention_mask.to(
+                device=device, dtype=torch.bool
+            )
         # action -> first-frame video only
         first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        mask[..., video_seq_len:, :first_frame_tokens] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -445,7 +640,249 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
+    def _build_streaming_training_batch(
+        self,
+        action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Construct every padded cold-start configuration for one observation.
+
+        Config ``k`` contains ``k + 1`` real slots. Its real slots occupy the
+        final ``k + 1`` intervals of the shifted flow schedule, matching the
+        buffer states encountered during streaming cold start.
+        """
+        if action.ndim != 3:
+            raise ValueError(f"`action` must be [B,H,A], got {tuple(action.shape)}.")
+        batch_size, horizon, action_dim = action.shape
+        num_slots = self.streaming_action_num_slots
+        chunk_size = self.streaming_action_chunk_size
+        validate_streaming_config(
+            num_slots=num_slots,
+            chunk_size=chunk_size,
+            action_horizon=horizon,
+        )
+
+        if action_is_pad is None:
+            base_valid = torch.ones(
+                (batch_size, horizon), dtype=torch.bool, device=action.device
+            )
+        else:
+            if action_is_pad.shape != (batch_size, horizon):
+                raise ValueError(
+                    "`action_is_pad` must match [B,H], got "
+                    f"{tuple(action_is_pad.shape)} vs {(batch_size, horizon)}."
+                )
+            base_valid = ~action_is_pad.to(device=action.device, dtype=torch.bool)
+
+        config_index = torch.arange(num_slots, device=action.device)
+        slot_index = torch.arange(num_slots, device=action.device)
+        num_real = config_index + 1
+        config_slot_valid = slot_index.unsqueeze(0) < num_real.unsqueeze(1)
+
+        # The left-aligned real slots use the suffix of the clean->noisy stage
+        # sequence: N=4 gives [3,P,P,P], [2,3,P,P], ... [0,1,2,3].
+        stage = num_slots - num_real.unsqueeze(1) + slot_index.unsqueeze(0)
+        stage = stage.clamp(max=num_slots - 1)
+        stage = stage.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Uniformly sample in the raw flow interval, then apply FastWAM's
+        # shifted sigma map. All C tokens in a slot share the same timestep.
+        interval_sample = torch.rand(
+            (batch_size, num_slots, num_slots),
+            device=action.device,
+            dtype=torch.float32,
+        )
+        u = (stage.to(torch.float32) + interval_sample) / float(num_slots)
+        sigma_per_slot = self.train_action_scheduler._phi(
+            u, self.train_action_scheduler.shift
+        )
+        sigma_per_slot = torch.where(
+            config_slot_valid.unsqueeze(0),
+            sigma_per_slot,
+            torch.ones_like(sigma_per_slot),
+        )
+        sigma = (
+            sigma_per_slot.unsqueeze(-1)
+            .expand(-1, -1, -1, chunk_size)
+            .reshape(batch_size, num_slots * horizon)
+        )
+        timestep = sigma * float(self.train_action_scheduler.num_train_timesteps)
+
+        config_valid = (
+            config_slot_valid.unsqueeze(-1)
+            .expand(-1, -1, chunk_size)
+            .reshape(num_slots, horizon)
+        )
+        valid = config_valid.unsqueeze(0) & base_valid.unsqueeze(1)
+
+        clean = action.unsqueeze(1).expand(-1, num_slots, -1, -1).clone()
+        clean = clean.masked_fill(~valid.unsqueeze(-1), 0)
+        clean = clean.reshape(batch_size, num_slots * horizon, action_dim)
+        valid = valid.reshape(batch_size, num_slots * horizon)
+
+        noise = torch.randn_like(clean)
+        sigma_model = sigma.to(device=action.device, dtype=action.dtype).unsqueeze(-1)
+        noisy = (1.0 - sigma_model) * clean + sigma_model * noise
+        target = noise - clean
+        return {
+            "clean": clean,
+            "noisy": noisy,
+            "target": target,
+            "timestep": timestep.to(dtype=action.dtype),
+            "valid": valid,
+        }
+
+    def _build_streaming_training_action_mask(
+        self,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Block config branches while retaining slot-causal attention."""
+        if valid.ndim != 2:
+            raise ValueError(f"`valid` must be [B,N*H], got {tuple(valid.shape)}.")
+        batch_size, total_action_len = valid.shape
+        num_slots = self.streaming_action_num_slots
+        chunk_size = self.streaming_action_chunk_size
+        horizon = num_slots * chunk_size
+        expected = num_slots * horizon
+        if total_action_len != expected:
+            raise ValueError(
+                f"Streaming training action length must be N*H={expected}, got {total_action_len}."
+            )
+
+        local_causal = slot_block_causal_action_mask(
+            num_slots=num_slots,
+            chunk_size=chunk_size,
+            device=valid.device,
+        )
+        mask = torch.zeros(
+            (batch_size, total_action_len, total_action_len),
+            dtype=torch.bool,
+            device=valid.device,
+        )
+        for config_idx in range(num_slots):
+            start = config_idx * horizon
+            end = start + horizon
+            branch_valid = valid[:, start:end]
+            branch_mask = (
+                local_causal.unsqueeze(0)
+                & branch_valid.unsqueeze(1)
+                & branch_valid.unsqueeze(2)
+            )
+            mask[:, start:end, start:end] = branch_mask
+        return mask
+
+    def training_loss_streaming_action(self, sample, tiled: bool = False):
+        """FlashVLA-style action training with a shared clean video prefix.
+
+        The existing dataset horizon is expanded in-memory into all ``N``
+        padded cold-start configurations. The video branch sees only the clean
+        first frame, exactly as base FastWAM action inference does.
+        """
+        inputs = self.build_inputs(sample, tiled=tiled, first_frame_only=True)
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        stream = self._build_streaming_training_batch(
+            action=action,
+            action_is_pad=inputs["action_is_pad"],
+        )
+
+        first_frame_latents = inputs["input_latents"][:, :, :1]
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=first_frame_latents.device,
+        )
+        # Streaming fine-tuning freezes the pretrained video prefix. Besides
+        # avoiding unused trainable video-head parameters, no-grad keeps the
+        # shared prefix cache materially smaller than N duplicated branches.
+        with torch.no_grad():
+            video_pre = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            )
+            video_seq_len = int(video_pre["tokens"].shape[1])
+            video_attention_mask = self.video_expert.build_video_to_video_mask(
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                device=video_pre["tokens"].device,
+            )
+            video_kv_cache = self.mot.prefill_video_cache(
+                video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=video_attention_mask,
+            )
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=stream["noisy"],
+            timestep=stream["timestep"],
+            context=context,
+            context_mask=context_mask,
+        )
+        # Each training branch represents the same action horizon and must use
+        # the same action positions; do not let RoPE positions run across branch
+        # boundaries in the concatenated shared-observation sequence.
+        horizon = self.streaming_action_num_slots * self.streaming_action_chunk_size
+        base_freqs = self.action_expert.freqs[:horizon].view(horizon, 1, -1)
+        action_pre["freqs"] = base_freqs.repeat(
+            self.streaming_action_num_slots, 1, 1
+        ).to(device=action_pre["tokens"].device)
+
+        action_attention_mask = self._build_streaming_training_action_mask(
+            valid=stream["valid"]
+        )
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_pre["tokens"].shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+            action_attention_mask=action_attention_mask,
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+
+        token_loss = F.mse_loss(
+            pred_action.float(), stream["target"].float(), reduction="none"
+        ).mean(dim=2)
+        valid_float = stream["valid"].to(dtype=token_loss.dtype)
+        token_weight = self.train_action_scheduler.training_weight(
+            stream["timestep"]
+        ).to(device=token_loss.device, dtype=token_loss.dtype)
+        valid_sum = valid_float.sum(dim=1).clamp(min=1.0)
+        loss_per_sample = (token_loss * token_weight * valid_float).sum(dim=1) / valid_sum
+        loss_action = loss_per_sample.mean()
+        loss_total = self.loss_lambda_action * loss_action
+        return loss_total, {
+            "loss_video": 0.0,
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_streaming_action": self.loss_lambda_action
+            * float(loss_action.detach().item()),
+        }
+
     def training_loss(self, sample, tiled: bool = False):
+        if self.streaming_action_enabled:
+            return self.training_loss_streaming_action(sample=sample, tiled=tiled)
+
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -918,6 +1355,7 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        latency_recorder: Optional[Any] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -957,6 +1395,8 @@ class FastWAM(torch.nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
+        if latency_recorder is not None:
+            latency_recorder.start("video_kv_prefill")
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
@@ -1020,6 +1460,9 @@ class FastWAM(torch.nn.Module):
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
+        if latency_recorder is not None:
+            latency_recorder.stop("video_kv_prefill")
+            latency_recorder.start("action_prediction")
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1043,9 +1486,451 @@ class FastWAM(torch.nn.Module):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+        if latency_recorder is not None:
+            latency_recorder.stop("action_prediction")
+
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+
+    @torch.no_grad()
+    def infer_action_profiled(
+        self,
+        latency_recorder: Any,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Run the legacy action path while recording the canonical two stages."""
+        if latency_recorder is None:
+            raise ValueError("`latency_recorder` is required for profiled inference.")
+        eager_method = getattr(self, "_infer_action_eager", self.infer_action)
+        return eager_method(latency_recorder=latency_recorder, **kwargs)
+
+    @torch.no_grad()
+    def initialize_action_stream_state(
+        self,
+        initial_noise: torch.Tensor,
+        sigma_shift: Optional[float] = None,
+    ) -> StreamingActionState:
+        """Initialize caller-owned padded streaming state from one noise chunk."""
+        if not self.streaming_action_enabled:
+            raise RuntimeError(
+                "Streaming action is disabled. Set model.streaming_action.enabled=true."
+            )
+        effective_shift = (
+            float(self.infer_action_scheduler.shift)
+            if sigma_shift is None
+            else float(sigma_shift)
+        )
+        if not math.isfinite(effective_shift) or effective_shift <= 0:
+            raise ValueError(f"`sigma_shift` must be positive, got {effective_shift}.")
+        state = initialize_streaming_action_state(
+            initial_noise=initial_noise.to(device=self.device, dtype=torch.float32),
+            num_slots=self.streaming_action_num_slots,
+            chunk_size=self.streaming_action_chunk_size,
+            schedule_shift=effective_shift,
+        )
+        if state.buffer.shape[2] != int(self.action_expert.action_dim):
+            raise ValueError(
+                "Initial streaming noise action dim mismatch: "
+                f"expected {self.action_expert.action_dim}, got {state.buffer.shape[2]}."
+            )
+        return state
+
+    def _sample_streaming_noise_chunk(
+        self,
+        batch_size: int,
+        action_generator: torch.Generator,
+    ) -> torch.Tensor:
+        if not isinstance(action_generator, torch.Generator):
+            raise TypeError(
+                "`action_generator` must be a caller-owned torch.Generator."
+            )
+        generator_device = action_generator.device
+        return torch.randn(
+            (
+                batch_size,
+                self.streaming_action_chunk_size,
+                int(self.action_expert.action_dim),
+            ),
+            generator=action_generator,
+            device=generator_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def infer_action_stream_step(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        state: StreamingActionState,
+        new_noise: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        sigma_shift: Optional[float] = None,
+        tiled: bool = False,
+        latency_recorder: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Advance one FlashVLA action-buffer stage for one control call.
+
+        This low-level API performs no random sampling. Both ``state`` and the
+        next noise chunk are supplied by the caller, and the returned state is
+        a new FP32 value rather than model-global mutable state.
+        """
+        self.eval()
+        if not self.streaming_action_enabled:
+            raise RuntimeError(
+                "Streaming action is disabled. Set model.streaming_action.enabled=true."
+            )
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action_stream_step` requires "
+                "`video_attention_mask_mode='first_frame_causal'`."
+            )
+        if not isinstance(state, StreamingActionState):
+            raise TypeError(
+                f"`state` must be StreamingActionState, got {type(state).__name__}."
+            )
+
+        batch_size, action_horizon, action_dim = state.buffer.shape
+        validate_streaming_config(
+            num_slots=self.streaming_action_num_slots,
+            chunk_size=self.streaming_action_chunk_size,
+            action_horizon=action_horizon,
+        )
+        if batch_size != 1:
+            raise ValueError(
+                "Current image VAE action inference supports batch_size=1, "
+                f"got streaming state batch {batch_size}."
+            )
+        if action_dim != int(self.action_expert.action_dim):
+            raise ValueError(
+                f"Streaming state action dim must be {self.action_expert.action_dim}, got {action_dim}."
+            )
+        if state.buffer.device != self.device:
+            raise ValueError(
+                f"Streaming state must be on model device {self.device}, got {state.buffer.device}."
+            )
+        effective_shift = (
+            float(self.infer_action_scheduler.shift)
+            if sigma_shift is None
+            else float(sigma_shift)
+        )
+        if not math.isfinite(effective_shift) or effective_shift <= 0:
+            raise ValueError(f"`sigma_shift` must be positive, got {effective_shift}.")
+        if (
+            state.schedule_shift is not None
+            and float(state.schedule_shift) != effective_shift
+        ):
+            raise ValueError(
+                "Cannot change `sigma_shift` while reusing a streaming state: "
+                f"state={state.schedule_shift}, requested={effective_shift}. Reset the state first."
+            )
+        if new_noise.shape != (
+            batch_size,
+            self.streaming_action_chunk_size,
+            action_dim,
+        ):
+            raise ValueError(
+                "`new_noise` must be [B,C,A], got "
+                f"{tuple(new_noise.shape)}."
+            )
+        new_noise = new_noise.to(device=self.device, dtype=torch.float32)
+
+        # State validity must be a slot-aligned prefix and remain synchronized
+        # with the per-episode step counter.
+        slot_valid_tokens = state.valid_mask.reshape(
+            batch_size,
+            self.streaming_action_num_slots,
+            self.streaming_action_chunk_size,
+        )
+        slot_all = slot_valid_tokens.all(dim=2)
+        slot_any = slot_valid_tokens.any(dim=2)
+        if not torch.equal(slot_all, slot_any):
+            raise ValueError("Streaming valid_mask must mark complete action slots.")
+        expected_prefix = (
+            torch.arange(self.streaming_action_num_slots, device=self.device).unsqueeze(0)
+            < (state.steps + 1)
+            .clamp(max=self.streaming_action_num_slots)
+            .unsqueeze(1)
+        )
+        if not torch.equal(slot_all, expected_prefix):
+            raise ValueError(
+                "Streaming valid_mask is inconsistent with state.steps; reset or restore both together."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                "`input_image` must be resized before infer, expected multiples "
+                f"of 16 but got HxW=({height},{width})"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError(
+                    "`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled."
+                )
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim != 2 or proprio.shape[0] != 1:
+                raise ValueError(
+                    f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}"
+                )
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(
+                    f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}"
+                )
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        if latency_recorder is not None:
+            latency_recorder.start("video_kv_prefill")
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(
+            input_image=input_image,
+            tiled=tiled,
+        )
+        fuse_flag = bool(
+            getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
+        )
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    "`context/context_mask` must be [B,L,D]/[B,L], got "
+                    f"{tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+                raise ValueError("Context batch size must match streaming state batch size.")
+            context = context.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+            context_mask = context_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+
+        timestep_video = torch.zeros(
+            (batch_size,),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        video_attention_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=video_attention_mask,
+        )
+        if latency_recorder is not None:
+            latency_recorder.stop("video_kv_prefill")
+            latency_recorder.start("action_prediction")
+
+        slot_timesteps, slot_deltas = self.infer_action_scheduler.build_streaming_slot_schedule(
+            num_slots=self.streaming_action_num_slots,
+            device=self.device,
+            dtype=torch.float32,
+            shift_override=effective_shift,
+        )
+        timestep_action = cold_start_token_values(
+            clean_to_noisy_slot_values=slot_timesteps,
+            chunk_size=self.streaming_action_chunk_size,
+            step=state.steps,
+            padding_value=slot_timesteps[-1],
+            batch_size=batch_size,
+        ).to(dtype=self.torch_dtype)
+        delta_action = cold_start_token_values(
+            clean_to_noisy_slot_values=slot_deltas,
+            chunk_size=self.streaming_action_chunk_size,
+            step=state.steps,
+            padding_value=0.0,
+            batch_size=batch_size,
+        )
+        base_action_mask = slot_block_causal_action_mask(
+            num_slots=self.streaming_action_num_slots,
+            chunk_size=self.streaming_action_chunk_size,
+            device=self.device,
+        )
+        action_attention_mask = (
+            base_action_mask.unsqueeze(0)
+            & state.valid_mask.unsqueeze(1)
+            & state.valid_mask.unsqueeze(2)
+        )
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_horizon,
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=self.device,
+            action_attention_mask=action_attention_mask,
+        )
+        pred_action = self._predict_action_noise_with_cache(
+            latents_action=state.buffer.to(dtype=self.torch_dtype),
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        token_delta = pred_action.float() * delta_action.float().unsqueeze(-1)
+        updated_buffer = update_action_buffer(
+            buffer=state.buffer,
+            token_delta=token_delta,
+            valid_mask=state.valid_mask,
+        )
+
+        buffer_was_full = bool(state.valid_mask.all().item())
+        emitted: Optional[torch.Tensor]
+        if buffer_was_full:
+            emitted, next_buffer = emit_shift_append_action_buffer(
+                updated_buffer=updated_buffer,
+                new_noise=new_noise,
+                chunk_size=self.streaming_action_chunk_size,
+            )
+            next_valid_mask = torch.ones_like(state.valid_mask)
+        else:
+            emitted = None
+            next_buffer, next_valid_mask = append_cold_start_noise(
+                buffer=updated_buffer,
+                new_noise=new_noise,
+                valid_mask=state.valid_mask,
+                chunk_size=self.streaming_action_chunk_size,
+            )
+        next_state = StreamingActionState(
+            buffer=next_buffer,
+            valid_mask=next_valid_mask,
+            steps=state.steps + 1,
+            schedule_shift=effective_shift,
+        )
+        if latency_recorder is not None:
+            latency_recorder.stop("action_prediction")
+
+        action_out = None
+        if emitted is not None:
+            action_out = emitted[0].detach().to(device="cpu", dtype=torch.float32)
+        return {"action": action_out, "state": next_state}
+
+    @torch.no_grad()
+    def infer_action_streaming(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        streaming_state: Optional[StreamingActionState],
+        action_generator: torch.Generator,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 1,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        latency_recorder: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Caller-stateful public streaming protocol used by policies/benchmarks."""
+        del negative_prompt, text_cfg_scale, num_inference_steps, seed, rand_device
+        expected_horizon = (
+            self.streaming_action_num_slots * self.streaming_action_chunk_size
+        )
+        if int(action_horizon) != expected_horizon:
+            raise ValueError(
+                f"Streaming action_horizon must be {expected_horizon}, got {action_horizon}."
+            )
+        if streaming_state is None:
+            initial_noise = self._sample_streaming_noise_chunk(
+                batch_size=1,
+                action_generator=action_generator,
+            )
+            streaming_state = self.initialize_action_stream_state(
+                initial_noise,
+                sigma_shift=sigma_shift,
+            )
+        new_noise = self._sample_streaming_noise_chunk(
+            batch_size=streaming_state.buffer.shape[0],
+            action_generator=action_generator,
+        )
+        result = self.infer_action_stream_step(
+            prompt=prompt,
+            input_image=input_image,
+            state=streaming_state,
+            new_noise=new_noise,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            sigma_shift=sigma_shift,
+            tiled=tiled,
+            latency_recorder=latency_recorder,
+        )
+        return {
+            "action": result["action"],
+            "streaming_state": result["state"],
+        }
+
+    @torch.no_grad()
+    def infer_action_streaming_profiled(
+        self,
+        latency_recorder: Any,
+        **kwargs,
+    ) -> dict[str, Any]:
+        if latency_recorder is None:
+            raise ValueError("`latency_recorder` is required for profiled inference.")
+        eager_method = getattr(
+            self,
+            "_infer_action_streaming_eager",
+            self.infer_action_streaming,
+        )
+        return eager_method(
+            latency_recorder=latency_recorder,
+            **kwargs,
+        )
 
     @torch.no_grad()
     def infer(
@@ -1085,11 +1970,37 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
+    def streaming_action_checkpoint_metadata(self) -> dict[str, Any]:
+        return {
+            "enabled": self.streaming_action_enabled,
+            "objective": (
+                "flashvla_action_streaming_v1"
+                if self.streaming_action_enabled
+                else "legacy"
+            ),
+            "num_slots": (
+                self.streaming_action_num_slots
+                if self.streaming_action_enabled
+                else None
+            ),
+            "chunk_size": (
+                self.streaming_action_chunk_size
+                if self.streaming_action_enabled
+                else None
+            ),
+            "action_train_shift": float(self.train_action_scheduler.shift),
+            "action_infer_shift": float(self.infer_action_scheduler.shift),
+            "action_num_train_timesteps": int(
+                self.train_action_scheduler.num_train_timesteps
+            ),
+        }
+
     def save_checkpoint(self, path, optimizer=None, step=None):
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "streaming_action": self.streaming_action_checkpoint_metadata(),
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -1099,13 +2010,79 @@ class FastWAM(torch.nn.Module):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Checkpoint payload must be a dict, got {type(payload).__name__}: {path}"
+            )
+        if "mot" not in payload and "dit" not in payload:
+            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
+
+        streaming_metadata = payload.get("streaming_action")
+        if streaming_metadata is not None and not isinstance(streaming_metadata, dict):
+            raise ValueError(
+                "Checkpoint `streaming_action` metadata must be a dict, got "
+                f"{type(streaming_metadata).__name__}."
+            )
+        if streaming_metadata is not None and not isinstance(
+            streaming_metadata.get("enabled"), bool
+        ):
+            raise ValueError(
+                "Checkpoint `streaming_action.enabled` metadata must be boolean."
+            )
+        checkpoint_is_streaming = bool(
+            streaming_metadata is not None
+            and streaming_metadata.get("enabled", False)
+        )
+        if checkpoint_is_streaming:
+            expected_objective = "flashvla_action_streaming_v1"
+            if streaming_metadata.get("objective") != expected_objective:
+                raise ValueError(
+                    "Unsupported streaming checkpoint objective: "
+                    f"{streaming_metadata.get('objective')!r}; expected {expected_objective!r}."
+                )
+            if self.streaming_action_enabled:
+                expected_values = {
+                    "num_slots": self.streaming_action_num_slots,
+                    "chunk_size": self.streaming_action_chunk_size,
+                    "action_train_shift": float(self.train_action_scheduler.shift),
+                    "action_infer_shift": float(self.infer_action_scheduler.shift),
+                    "action_num_train_timesteps": int(
+                        self.train_action_scheduler.num_train_timesteps
+                    ),
+                }
+                mismatches = {
+                    key: (streaming_metadata.get(key), expected)
+                    for key, expected in expected_values.items()
+                    if streaming_metadata.get(key) != expected
+                }
+                if mismatches:
+                    raise ValueError(
+                        "Streaming checkpoint/config metadata mismatch: "
+                        f"{mismatches}."
+                    )
+
+        # Mutate weights only after all objective/config compatibility checks
+        # above have succeeded.
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
-        elif "dit" in payload:
+        else:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             self.video_expert.load_state_dict(payload["dit"], strict=False)
-        else:
-            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
+        self.loaded_checkpoint_streaming_action = (
+            None if streaming_metadata is None else dict(streaming_metadata)
+        )
+
+        if checkpoint_is_streaming and not self.streaming_action_enabled:
+            logger.warning(
+                "Loading a streaming-trained checkpoint while streaming_action is disabled; "
+                "legacy action inference does not match its training objective."
+            )
+        elif not checkpoint_is_streaming and self.streaming_action_enabled:
+            logger.warning(
+                "Streaming action is enabled, but checkpoint %s has no compatible streaming "
+                "training metadata. Treat it only as legacy initialization and fine-tune before deployment.",
+                path,
+            )
         if self.proprio_encoder is not None:
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)

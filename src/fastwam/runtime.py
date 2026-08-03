@@ -90,6 +90,11 @@ def create_fastwam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    streaming_action=None,
+    torch_compile_infer_action: bool = False,
+    torch_compile_mode: str = "max-autotune",
+    torch_compile_dynamic: bool | None = True,
+    torch_compile_disable_cudagraphs: bool = True,
 ):
     from .models.wan22.fastwam import FastWAM
 
@@ -133,6 +138,15 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(streaming_action, DictConfig):
+        streaming_action = OmegaConf.to_container(streaming_action, resolve=True)
+    if streaming_action is None:
+        streaming_action = {}
+    if not isinstance(streaming_action, dict):
+        raise ValueError(
+            f"`streaming_action` must be dict-like, got {type(streaming_action)}"
+        )
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -153,8 +167,15 @@ def create_fastwam(
         action_train_shift=float(action_scheduler["train_shift"]),
         action_infer_shift=float(action_scheduler["infer_shift"]),
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        streaming_action_enabled=bool(streaming_action.get("enabled", False)),
+        streaming_action_num_slots=int(streaming_action.get("num_slots", 8)),
+        streaming_action_chunk_size=int(streaming_action.get("chunk_size", 4)),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        torch_compile_infer_action=bool(torch_compile_infer_action),
+        torch_compile_mode=str(torch_compile_mode),
+        torch_compile_dynamic=torch_compile_dynamic,
+        torch_compile_disable_cudagraphs=bool(torch_compile_disable_cudagraphs),
     )
 
 

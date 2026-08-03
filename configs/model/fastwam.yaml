@@ -54,5 +54,13 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+# FlashVLA-style streaming action decoding is opt-in. 8 slots x 4 actions
+# preserves the current 32-action horizon; enabling it requires a streaming-
+# trained checkpoint and caller-owned per-episode state.
+streaming_action:
+  enabled: false
+  num_slots: 8
+  chunk_size: 4
+
 loss:
   lambda_action: 1.0

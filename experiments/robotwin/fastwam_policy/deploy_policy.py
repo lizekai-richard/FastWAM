@@ -163,12 +163,66 @@ class WorldActionRobotWinPolicy:
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
 
+        checkpoint_streaming = getattr(
+            self.model, "loaded_checkpoint_streaming_action", None
+        )
+        model_streaming = bool(
+            getattr(self.model, "streaming_action_enabled", False)
+        )
+        checkpoint_is_streaming = bool(
+            isinstance(checkpoint_streaming, dict)
+            and checkpoint_streaming.get("enabled", False)
+        )
+        if model_streaming and not checkpoint_is_streaming:
+            raise RuntimeError(
+                "RoboTwin streaming deployment requires a checkpoint trained with "
+                "the streaming objective and matching metadata. A legacy checkpoint "
+                "is valid only as fine-tuning initialization."
+            )
+        if checkpoint_is_streaming and not model_streaming:
+            raise RuntimeError(
+                "The checkpoint was trained for streaming action prediction, but "
+                "streaming_action is disabled. Pass model.streaming_action.enabled=true."
+            )
+        if checkpoint_is_streaming:
+            configured_shift = float(self.model.infer_action_scheduler.shift)
+            requested_shift = (
+                configured_shift if sigma_shift is None else float(sigma_shift)
+            )
+            checkpoint_shift = float(checkpoint_streaming["action_infer_shift"])
+            if requested_shift != checkpoint_shift:
+                raise RuntimeError(
+                    "RoboTwin streaming sigma shift must match the checkpoint: "
+                    f"requested={requested_shift}, checkpoint={checkpoint_shift}."
+                )
+
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
         self.action_horizon = int(action_horizon)
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
+        self.streaming_action_enabled = bool(
+            getattr(self.model, "streaming_action_enabled", False)
+        )
+        self.streaming_action_state = None
+        self._streaming_generator: Optional[torch.Generator] = None
+        if self.streaming_action_enabled:
+            expected_horizon = int(self.model.streaming_action_num_slots) * int(
+                self.model.streaming_action_chunk_size
+            )
+            if self.action_horizon != expected_horizon:
+                raise ValueError(
+                    "Streaming action horizon must equal num_slots * chunk_size: "
+                    f"got horizon={self.action_horizon}, expected={expected_horizon}."
+                )
+            if self.replan_steps != int(self.model.streaming_action_chunk_size):
+                logger.info(
+                    "Streaming action overrides replan_steps from %d to chunk_size=%d.",
+                    self.replan_steps,
+                    int(self.model.streaming_action_chunk_size),
+                )
+                self.replan_steps = int(self.model.streaming_action_chunk_size)
         self.num_inference_steps = int(num_inference_steps)
         self.sigma_shift = sigma_shift
         self.seed = seed
@@ -183,14 +237,29 @@ class WorldActionRobotWinPolicy:
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._reset_streaming_generator()
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
+            "horizon=%d | replan=%d | streaming=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.streaming_action_enabled,
         )
+
+    def _reset_streaming_generator(self) -> None:
+        if not self.streaming_action_enabled:
+            self._streaming_generator = None
+            return
+        self._streaming_generator = torch.Generator(device=self.rand_device)
+        if self.seed is None:
+            self._streaming_generator.seed()
+        else:
+            self._streaming_generator.manual_seed(
+                int(self.seed) + int(self.episode_count)
+            )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
         state_meta = self.processor.shape_meta["state"]
@@ -233,7 +302,11 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
-    def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
+    def _infer_action_chunk(
+        self,
+        observation: Dict[str, Any],
+        instruction: str,
+    ) -> Optional[np.ndarray]:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
@@ -242,7 +315,6 @@ class WorldActionRobotWinPolicy:
         infer_kwargs = {
             "prompt": prompt,
             "input_image": image_tensor,
-            "action_horizon": self.action_horizon,
             "proprio": proprio,
             "negative_prompt": self.negative_prompt,
             "text_cfg_scale": self.text_cfg_scale,
@@ -252,20 +324,44 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
-            infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            if self.streaming_action_enabled:
+                if self._streaming_generator is None:
+                    raise RuntimeError("Streaming action generator was not initialized.")
+                pred = self.model.infer_action_streaming(
+                    action_horizon=self.action_horizon,
+                    streaming_state=self.streaming_action_state,
+                    action_generator=self._streaming_generator,
+                    **infer_kwargs,
+                )
+                self.streaming_action_state = pred["streaming_state"]
+            else:
+                infer_kwargs["action_horizon"] = self.action_horizon
+                if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
+                    infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+                pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        action_tensor = pred["action"]  # [T, D]
+        action_tensor = pred["action"]
+        if action_tensor is None:
+            return None
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
         return action_chunk
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        if action_chunk is None:
+            # Padded cold start intentionally emits no learned action until the
+            # N-stage buffer is full. RoboTwin uses absolute qpos commands, so
+            # replaying the current joint vector is the safe hold action. One
+            # streaming call represents a full C-action control interval, so
+            # preserve the same cadence during cold start as in steady state.
+            hold = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
+            for _ in range(self.replan_steps):
+                self.pending_actions.append(hold.copy())
+            return
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
@@ -308,6 +404,8 @@ class WorldActionRobotWinPolicy:
         self.pending_actions.clear()
         self.episode_count += 1
         self.step_count = 0
+        self.streaming_action_state = None
+        self._reset_streaming_generator()
         self.reset_timing_rollout()
 
 
@@ -324,6 +422,30 @@ def get_model(usr_args: Dict[str, Any]):
         sim_cfg_name=sim_cfg_name,
         sim_task=sim_task,
     )
+
+    # Keep legacy inference as the config default, while allowing the RoboTwin
+    # launcher to opt into a streaming-trained checkpoint without maintaining a
+    # second sim config file.
+    streaming_enabled = usr_args.get("streaming_action_enabled")
+    streaming_num_slots = usr_args.get("streaming_action_num_slots")
+    streaming_chunk_size = usr_args.get("streaming_action_chunk_size")
+    streaming_cfg = cfg.model.get("streaming_action")
+    if streaming_cfg is None:
+        if (
+            not _is_none_like(streaming_enabled)
+            and _parse_bool(streaming_enabled)
+        ):
+            raise ValueError(
+                "The selected model does not support streaming_action. "
+                "Use the base FastWAM model config."
+            )
+    else:
+        if not _is_none_like(streaming_enabled):
+            streaming_cfg.enabled = _parse_bool(streaming_enabled)
+        if not _is_none_like(streaming_num_slots):
+            streaming_cfg.num_slots = int(streaming_num_slots)
+        if not _is_none_like(streaming_chunk_size):
+            streaming_cfg.chunk_size = int(streaming_chunk_size)
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):

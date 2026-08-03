@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Benchmark FastWAM action inference latency on real dataset samples.
+"""Benchmark legacy or streaming FastWAM action inference on real samples.
 
 Preset selection is intentionally tied to camera count:
   - 2 views: LIBERO data/config + LIBERO release checkpoint.
   - 3 views: RoboTwin data/config + RoboTwin release checkpoint.
+
+Both modes use the same two-stage breakdown: video KV prefill (including VAE)
+and action prediction. Streaming measurements are steady-state only, keep one
+caller-owned state/RNG per sample, and require explicit streaming model APIs;
+the benchmark never substitutes or estimates missing measurements.
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
-import inspect
 import io
 import json
 import os
@@ -45,6 +49,23 @@ from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # noqa:
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
 from fastwam.runtime import _mixed_precision_to_model_dtype  # noqa: E402
 from fastwam.utils.config_resolvers import register_default_resolvers  # noqa: E402
+
+try:  # Support both direct script execution and module-style test imports.
+    from .inference_api import (  # type: ignore[import-not-found]
+        INFERENCE_MODES,
+        InferenceAPI,
+        accepts_keyword,
+        resolve_inference_api,
+        unpack_inference_result,
+    )
+except ImportError:
+    from inference_api import (  # type: ignore[no-redef]
+        INFERENCE_MODES,
+        InferenceAPI,
+        accepts_keyword,
+        resolve_inference_api,
+        unpack_inference_result,
+    )
 
 
 @dataclass(frozen=True)
@@ -114,6 +135,15 @@ class StageLatencyRecorder:
             "device": str(self.device),
             "stages_ms": stages_ms,
         }
+
+
+@dataclass
+class StreamingRunState:
+    """Benchmark-owned state for one independent streaming rollout."""
+
+    model_state: Any = None
+    action_generator: torch.Generator | None = None
+    cold_start_calls: int = 0
 
 
 PRESETS = {
@@ -556,6 +586,52 @@ def _summarize_breakdown_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _make_action_generator(
+    *,
+    seed: int | None,
+    sample_index: int,
+    rand_device: str,
+) -> torch.Generator:
+    """Create one RNG per benchmark rollout instead of reseeding each call."""
+
+    generator = torch.Generator(device=rand_device)
+    if seed is None:
+        generator.seed()
+    else:
+        generator.manual_seed(int(seed) + int(sample_index))
+    return generator
+
+
+def _prepare_streaming_call_kwargs(
+    method: Any,
+    base_kwargs: dict[str, Any],
+    run_state: StreamingRunState,
+) -> dict[str, Any]:
+    """Attach caller-owned state and RNG to the explicit streaming protocol."""
+
+    method_name = getattr(method, "__qualname__", type(method).__name__)
+    if not accepts_keyword(method, "streaming_state"):
+        raise RuntimeError(
+            f"{method_name} must accept streaming_state=; streaming state cannot be model-global."
+        )
+
+    kwargs = dict(base_kwargs)
+    kwargs["streaming_state"] = run_state.model_state
+    # Reusing infer_action(seed=...) on every call would restart the same noise
+    # sequence. Streaming owns one generator for the full episode instead.
+    kwargs.pop("seed", None)
+    if accepts_keyword(method, "action_generator"):
+        kwargs["action_generator"] = run_state.action_generator
+    elif accepts_keyword(method, "generator"):
+        kwargs["generator"] = run_state.action_generator
+    else:
+        raise RuntimeError(
+            f"{method_name} must accept action_generator= or generator= so "
+            "streaming noise is episode-owned and is not reset on every call."
+        )
+    return kwargs
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -578,6 +654,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations before timing.")
     parser.add_argument("--iters", type=int, default=20, help="Timed iterations.")
     parser.add_argument("--num-inference-steps", type=int, default=10, help="Diffusion/flow inference steps.")
+    parser.add_argument(
+        "--inference-mode",
+        choices=INFERENCE_MODES,
+        default="legacy",
+        help=(
+            "Use legacy iterative infer_action or caller-stateful infer_action_streaming. "
+            "Streaming mode fails fast if the model does not expose the streaming API."
+        ),
+    )
     parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="bf16")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--rand-device", type=str, default="cpu")
@@ -650,6 +735,11 @@ def main() -> None:
     cfg = _load_hydra_cfg(preset.task)
     cfg.data.train.pretrained_norm_stats = str(dataset_stats_path)
     cfg.data.train.is_training_set = False
+    if "streaming_action" not in cfg.model:
+        raise RuntimeError(
+            "Model config has no streaming_action section. Use the updated configs/model/fastwam.yaml."
+        )
+    cfg.model.streaming_action.enabled = args.inference_mode == "streaming"
     cfg.model.torch_compile_infer_action = bool(args.torch_compile)
     cfg.model.torch_compile_mode = "max-autotune"
     cfg.model.torch_compile_dynamic = True
@@ -685,6 +775,16 @@ def main() -> None:
 
     action_horizon = int(cfg.data.train.num_frames) - 1
     num_video_frames = (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
+    streaming_num_slots = int(cfg.model.streaming_action.num_slots)
+    streaming_chunk_size = int(cfg.model.streaming_action.chunk_size)
+    if args.inference_mode == "streaming":
+        configured_horizon = streaming_num_slots * streaming_chunk_size
+        if configured_horizon != action_horizon:
+            raise ValueError(
+                "Streaming buffer must cover the dataset action horizon exactly: "
+                f"num_slots({streaming_num_slots}) * chunk_size({streaming_chunk_size}) "
+                f"= {configured_horizon}, action_horizon={action_horizon}."
+            )
 
     model = _load_model(
         cfg=cfg,
@@ -696,6 +796,11 @@ def main() -> None:
     compile_targets = list(getattr(model, "torch_compile_targets", []))
     seed = _parse_optional_int(args.seed)
     sigma_shift = _parse_optional_float(args.sigma_shift)
+    inference_api = resolve_inference_api(
+        model,
+        args.inference_mode,
+        require_profiled=bool(args.latency_breakdown),
+    )
 
     benchmark_inputs: list[dict[str, Any]] = []
     for sample_idx in range(sample_start, sample_end):
@@ -731,7 +836,7 @@ def main() -> None:
         raise RuntimeError("No benchmark inputs were constructed.")
     input_image_shape = list(benchmark_inputs[0]["input_image"].shape)
 
-    accepts_num_video_frames = "num_video_frames" in inspect.signature(model.infer_action).parameters
+    accepts_num_video_frames = accepts_keyword(inference_api.canonical, "num_video_frames")
 
     def build_infer_kwargs(item: dict[str, Any]) -> dict[str, Any]:
         infer_kwargs: dict[str, Any] = {
@@ -756,27 +861,91 @@ def main() -> None:
             infer_kwargs["num_video_frames"] = num_video_frames
         return infer_kwargs
 
-    def infer_once(item: dict[str, Any]) -> torch.Tensor:
-        with torch.inference_mode():
-            pred = model.infer_action(**build_infer_kwargs(item))
-        return pred["action"]
+    def make_streaming_runs() -> dict[int, StreamingRunState]:
+        if not inference_api.stateful:
+            return {}
+        return {
+            int(item["sample_index"]): StreamingRunState(
+                action_generator=_make_action_generator(
+                    seed=seed,
+                    sample_index=int(item["sample_index"]),
+                    rand_device=args.rand_device,
+                )
+            )
+            for item in benchmark_inputs
+        }
 
-    def infer_once_profiled(item: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
-        if not hasattr(model, "infer_action_profiled"):
+    def call_once(
+        item: dict[str, Any],
+        *,
+        api: InferenceAPI,
+        run_state: StreamingRunState | None,
+        profiled: bool,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        method = api.profiled if profiled else api.canonical
+        if method is None:
+            expected_name = api.profiled_name or f"{api.canonical_name}_profiled"
+            raise RuntimeError(f"Missing required profiled method {expected_name}().")
+
+        infer_kwargs = build_infer_kwargs(item)
+        if api.stateful:
+            if run_state is None:
+                raise RuntimeError("Streaming inference requires benchmark-owned run state.")
+            infer_kwargs = _prepare_streaming_call_kwargs(method, infer_kwargs, run_state)
+
+        recorder = StageLatencyRecorder(model.device) if profiled else None
+        if recorder is not None:
+            infer_kwargs["latency_recorder"] = recorder
+        with torch.inference_mode():
+            result = method(**infer_kwargs)
+        action, new_model_state = unpack_inference_result(result, api.mode)
+        if api.stateful:
+            assert run_state is not None
+            run_state.model_state = new_model_state
+        return action, recorder.finish() if recorder is not None else None
+
+    def require_steady_action(action: Any, *, sample_index: int, phase: str) -> None:
+        if action is None:
             raise RuntimeError(
-                f"{type(model).__name__} does not provide infer_action_profiled(); "
-                "latency breakdown currently supports the base FastWAM action path."
+                f"Streaming API returned action=None during {phase} for sample {sample_index}. "
+                "Only cold-start calls may omit an action; no placeholder latency is recorded."
             )
-        recorder = StageLatencyRecorder(model.device)
-        with torch.inference_mode():
-            pred = model.infer_action_profiled(
-                latency_recorder=recorder,
-                **build_infer_kwargs(item),
-            )
-        return pred["action"], recorder.finish()
 
+    def prime_streaming_runs(runs: dict[int, StreamingRunState]) -> None:
+        if not inference_api.stateful:
+            return
+        for item in benchmark_inputs:
+            sample_index = int(item["sample_index"])
+            run = runs[sample_index]
+            for _ in range(streaming_num_slots + 1):
+                action, _ = call_once(
+                    item,
+                    api=inference_api,
+                    run_state=run,
+                    profiled=False,
+                )
+                run.cold_start_calls += 1
+                if action is not None:
+                    break
+            else:
+                raise RuntimeError(
+                    "Streaming cold start did not produce an action within "
+                    f"num_slots+1={streaming_num_slots + 1} calls for sample {sample_index}."
+                )
+
+    canonical_runs = make_streaming_runs()
+    prime_streaming_runs(canonical_runs)
     for warmup_idx in range(args.warmup):
-        infer_once(benchmark_inputs[warmup_idx % len(benchmark_inputs)])
+        item = benchmark_inputs[warmup_idx % len(benchmark_inputs)]
+        sample_index = int(item["sample_index"])
+        action, _ = call_once(
+            item,
+            api=inference_api,
+            run_state=canonical_runs.get(sample_index),
+            profiled=False,
+        )
+        if inference_api.stateful:
+            require_steady_action(action, sample_index=sample_index, phase="canonical warmup")
     _sync_if_needed(model.device)
 
     if model.device.type == "cuda":
@@ -787,52 +956,97 @@ def main() -> None:
     total_timed_calls = int(args.iters) * len(benchmark_inputs)
     for _ in range(args.iters):
         for item in benchmark_inputs:
+            sample_index = int(item["sample_index"])
             _sync_if_needed(model.device)
             t0 = time.perf_counter()
-            infer_once(item)
+            action, _ = call_once(
+                item,
+                api=inference_api,
+                run_state=canonical_runs.get(sample_index),
+                profiled=False,
+            )
             _sync_if_needed(model.device)
+            if inference_api.stateful:
+                require_steady_action(action, sample_index=sample_index, phase="canonical timing")
             latency_ms = (time.perf_counter() - t0) * 1000.0
             latencies_ms.append(latency_ms)
             per_sample.append(
                 {
-                    "sample_index": int(item["sample_index"]),
+                    "sample_index": sample_index,
                     "latency_ms": float(latency_ms),
                 }
             )
 
     latency_breakdown: dict[str, Any] = {"enabled": False}
     if args.latency_breakdown:
+        profiled_runs = make_streaming_runs()
+        prime_streaming_runs(profiled_runs)
         for warmup_idx in range(args.breakdown_warmup):
-            infer_once_profiled(benchmark_inputs[warmup_idx % len(benchmark_inputs)])
+            item = benchmark_inputs[warmup_idx % len(benchmark_inputs)]
+            sample_index = int(item["sample_index"])
+            action, _ = call_once(
+                item,
+                api=inference_api,
+                run_state=profiled_runs.get(sample_index),
+                profiled=True,
+            )
+            if inference_api.stateful:
+                require_steady_action(action, sample_index=sample_index, phase="breakdown warmup")
 
         profiled_calls: list[dict[str, Any]] = []
         for _ in range(breakdown_iters):
             for item in benchmark_inputs:
-                _, raw_breakdown = infer_once_profiled(item)
+                sample_index = int(item["sample_index"])
+                action, raw_breakdown = call_once(
+                    item,
+                    api=inference_api,
+                    run_state=profiled_runs.get(sample_index),
+                    profiled=True,
+                )
+                if inference_api.stateful:
+                    require_steady_action(action, sample_index=sample_index, phase="breakdown timing")
+                if raw_breakdown is None:
+                    raise RuntimeError("Profiled inference returned no real latency records.")
                 normalized = _normalize_breakdown(raw=raw_breakdown)
-                normalized["sample_index"] = int(item["sample_index"])
+                normalized["sample_index"] = sample_index
                 profiled_calls.append(normalized)
 
+        canonical_is_compiled = bool(
+            args.torch_compile
+            and any(
+                target == inference_api.canonical_name
+                or target.endswith(f".{inference_api.canonical_name}")
+                for target in compile_targets
+            )
+        )
+        action_stage_definition = (
+            "Inference schedule construction plus the full iterative ActionDiT denoising loop, "
+            "including scheduler updates; output D2H is excluded"
+            if args.inference_mode == "legacy"
+            else (
+                "One ActionDiT prediction over the caller-owned rolling buffer plus the shifted "
+                "per-slot scheduler update, emission, shift, and noise append; output D2H is excluded"
+            )
+        )
         latency_breakdown = {
             "enabled": True,
+            "inference_mode": args.inference_mode,
             "execution_mode": "eager_instrumented",
-            "canonical_latency_execution_mode": "compiled" if args.torch_compile else "eager",
-            "same_execution_path_as_canonical_latency": not bool(args.torch_compile),
+            "canonical_latency_execution_mode": "compiled" if canonical_is_compiled else "eager",
+            "same_execution_path_as_canonical_latency": not canonical_is_compiled,
             "measurement_note": (
                 "CUDA stages use events on the current stream with one synchronization at call end. "
-                "Validation, action-noise initialization, and output D2H remain in canonical end-to-end "
-                "latency but are intentionally excluded from the two-stage breakdown. When torch_compile "
-                "is enabled, canonical latency is compiled but breakdown remains eager."
+                "The model must emit both named stages; the benchmark never derives or estimates either "
+                "stage from end-to-end latency. Host-side argument/state validation, caller RNG/noise "
+                "preparation, and output D2H are excluded. A compiled canonical method is profiled "
+                "through its explicit eager-instrumented companion."
             ),
             "stage_definitions": {
                 "video_kv_prefill": (
                     "Image device transfer, VAE encoding, conditioning, video token/mask preparation, "
                     "and the video transformer pass that materializes the KV cache"
                 ),
-                "action_prediction": (
-                    "Inference schedule construction plus the full iterative ActionDiT denoising loop, "
-                    "including scheduler updates; output D2H is excluded"
-                ),
+                "action_prediction": action_stage_definition,
             },
             "warmup": int(args.breakdown_warmup),
             "iters": int(breakdown_iters),
@@ -849,8 +1063,76 @@ def main() -> None:
             **_summarize_breakdown_calls(calls=profiled_calls),
         }
 
+    checkpoint_metadata = getattr(
+        model, "loaded_checkpoint_streaming_action", None
+    )
+    checkpoint_declares_streaming = bool(
+        isinstance(checkpoint_metadata, dict)
+        and checkpoint_metadata.get("enabled", False)
+    )
+    mode_matches_checkpoint = (
+        bool(inference_api.stateful) == checkpoint_declares_streaming
+        if checkpoint_metadata is not None
+        else not inference_api.stateful
+    )
+    effective_action_infer_shift = (
+        float(model.infer_action_scheduler.shift)
+        if sigma_shift is None
+        else float(sigma_shift)
+    )
+    shift_matches_checkpoint: bool | None = None
+    if checkpoint_declares_streaming:
+        shift_matches_checkpoint = (
+            checkpoint_metadata.get("action_infer_shift")
+            == effective_action_infer_shift
+        )
+    checkpoint_contract_matches = bool(
+        mode_matches_checkpoint and shift_matches_checkpoint is not False
+    )
+    if checkpoint_metadata is None:
+        checkpoint_compatibility = (
+            "legacy_initialization_only; latency_not_task_quality"
+            if inference_api.stateful
+            else "legacy_checkpoint_without_objective_metadata"
+        )
+    elif mode_matches_checkpoint and shift_matches_checkpoint is False:
+        checkpoint_compatibility = "streaming_schedule_mismatches_checkpoint"
+    elif mode_matches_checkpoint:
+        checkpoint_compatibility = (
+            "streaming_metadata_validated; latency_not_task_quality"
+            if inference_api.stateful
+            else "legacy_objective_metadata_present"
+        )
+    else:
+        checkpoint_compatibility = "inference_mode_mismatches_checkpoint_objective"
+
+    streaming_result = {
+        "enabled": bool(inference_api.stateful),
+        "state_ownership": "caller",
+        "rng_ownership": "caller_per_sample",
+        "num_slots": streaming_num_slots if inference_api.stateful else None,
+        "chunk_size": streaming_chunk_size if inference_api.stateful else None,
+        "buffer_horizon": (
+            streaming_num_slots * streaming_chunk_size if inference_api.stateful else None
+        ),
+        "cold_start_calls_by_sample": (
+            {
+                str(sample_index): int(run.cold_start_calls)
+                for sample_index, run in canonical_runs.items()
+            }
+            if inference_api.stateful
+            else {}
+        ),
+        "timed_phase": "steady_state" if inference_api.stateful else "full_legacy_call",
+        "checkpoint_compatibility": checkpoint_compatibility,
+        "checkpoint_metadata": checkpoint_metadata,
+        "mode_matches_checkpoint": bool(mode_matches_checkpoint),
+        "shift_matches_checkpoint": shift_matches_checkpoint,
+        "checkpoint_contract_matches": checkpoint_contract_matches,
+    }
+
     result = {
-        "schema_version": "2.1",
+        "schema_version": "3.0",
         "preset": preset.name,
         "num_views": int(args.num_views),
         "task": preset.task,
@@ -863,17 +1145,28 @@ def main() -> None:
         "num_samples": int(args.num_samples),
         "device": str(model.device),
         "mixed_precision": args.mixed_precision,
+        "inference_mode": args.inference_mode,
+        "inference_api": {
+            "canonical": inference_api.canonical_name,
+            "profiled": inference_api.profiled_name,
+        },
         "include_text_encoder": bool(args.include_text_encoder),
         "context_source": "text_encoder" if args.include_text_encoder else "zero_dummy",
-        "num_inference_steps": int(args.num_inference_steps),
+        "num_inference_steps": (
+            int(args.num_inference_steps) if args.inference_mode == "legacy" else None
+        ),
+        "sigma_shift_override": sigma_shift,
+        "effective_action_infer_shift": effective_action_infer_shift,
         "action_horizon": int(action_horizon),
         "num_video_frames": int(num_video_frames),
         "input_image_shape": input_image_shape,
         "warmup": int(args.warmup),
         "iters": int(args.iters),
         "total_timed_calls": int(total_timed_calls),
+        "streaming_action": streaming_result,
         "torch_compile": {
             "enabled": bool(getattr(model, "torch_compile_infer_action", False)),
+            "canonical_method": inference_api.canonical_name,
             "mode": getattr(model, "torch_compile_mode", None) if args.torch_compile else None,
             "dynamic": getattr(model, "torch_compile_dynamic", None) if args.torch_compile else None,
             "disable_cudagraphs": getattr(model, "torch_compile_disable_cudagraphs", None)

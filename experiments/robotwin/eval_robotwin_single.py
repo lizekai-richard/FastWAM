@@ -208,6 +208,23 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
+    streaming_cfg = cfg.model.get("streaming_action")
+    if streaming_cfg is not None:
+        _append_override(
+            overrides,
+            "streaming_action_enabled",
+            streaming_cfg.enabled,
+        )
+        _append_override(
+            overrides,
+            "streaming_action_num_slots",
+            streaming_cfg.num_slots,
+        )
+        _append_override(
+            overrides,
+            "streaming_action_chunk_size",
+            streaming_cfg.chunk_size,
+        )
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)

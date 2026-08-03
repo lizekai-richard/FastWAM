@@ -82,11 +82,33 @@ class MoT(nn.Module):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         attn_mask = attention_mask.to(device=q_cat.device)
+        batch_size = int(q_cat.shape[0])
+        if attn_mask.ndim == 3 and attn_mask.shape[0] not in (1, batch_size):
+            raise ValueError(
+                "3D attention mask batch must be 1 or match query batch "
+                f"{batch_size}, got {attn_mask.shape[0]}."
+            )
+        if attn_mask.ndim == 4:
+            if attn_mask.shape[0] not in (1, batch_size):
+                raise ValueError(
+                    "4D attention mask batch must be 1 or match query batch "
+                    f"{batch_size}, got {attn_mask.shape[0]}."
+                )
+            if attn_mask.shape[1] not in (1, self.num_heads):
+                raise ValueError(
+                    "4D attention mask head count must be 1 or match query heads "
+                    f"{self.num_heads}, got {attn_mask.shape[1]}."
+                )
+        if attn_mask.ndim == 3:
+            # PyTorch SDPA expects a batch-specific mask to include the head
+            # axis: [B, 1, Sq, Sk]. A 2D mask remains broadcast to all batches
+            # and heads, while an already-4D mask is passed through unchanged.
+            attn_mask = attn_mask.unsqueeze(1)
 
         def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
 
-        if self.mot_checkpoint_mixed_attn and self.training:
+        if self.mot_checkpoint_mixed_attn and self.training and torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(
                 _forward,
                 q_cat,
@@ -234,7 +256,7 @@ class MoT(nn.Module):
                 context_payload=_context_payload,
             )
 
-        if use_gradient_checkpointing and self.training:
+        if use_gradient_checkpointing and self.training and torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(
                 _post_fn,
                 mixed_slice,
@@ -372,20 +394,25 @@ class MoT(nn.Module):
             raise ValueError(
                 f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
             )
-        if attention_mask.ndim != 2:
-            raise ValueError(f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}")
-        if attention_mask.shape[0] != attention_mask.shape[1]:
+        if attention_mask.ndim not in (2, 3, 4):
+            raise ValueError(
+                "`attention_mask` must be [S,S], [B,S,S], or [B,H,S,S], "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[-2] != attention_mask.shape[-1]:
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         action_seq_len = int(action_tokens.shape[1])
         total_seq_len = int(video_seq_len) + action_seq_len
-        if attention_mask.shape[0] != total_seq_len:
+        if attention_mask.shape[-1] != total_seq_len:
             raise ValueError(
                 "`attention_mask` seq length mismatch: "
-                f"mask={attention_mask.shape[0]} vs expected_total={total_seq_len}"
+                f"mask={attention_mask.shape[-1]} vs expected_total={total_seq_len}"
             )
         # Use the action query rows from the joint [video+action] mask.
-        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+        action_attention_mask = attention_mask[
+            ..., video_seq_len:total_seq_len, :total_seq_len
+        ]
 
         expert = self.mixtures["action"]
         x = action_tokens
@@ -462,9 +489,12 @@ class MoT(nn.Module):
         if missing:
             raise ValueError(f"Missing expert t_mod for {missing}")
 
-        if attention_mask.ndim != 2:
-            raise ValueError(f"`attention_mask` must be 2D [S, S], got shape {tuple(attention_mask.shape)}")
-        if attention_mask.shape[0] != attention_mask.shape[1]:
+        if attention_mask.ndim not in (2, 3, 4):
+            raise ValueError(
+                "`attention_mask` must be [S,S], [B,S,S], or [B,H,S,S], "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[-2] != attention_mask.shape[-1]:
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
@@ -521,10 +551,10 @@ class MoT(nn.Module):
             v_cat = torch.cat(v_chunks, dim=1)
 
             total_seq = q_cat.shape[1]
-            if attention_mask.shape[0] != total_seq:
+            if attention_mask.shape[-1] != total_seq:
                 raise ValueError(
                     "Attention mask seq length mismatch: "
-                    f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
+                    f"mask={attention_mask.shape[-1]} vs tokens={total_seq}"
                 )
 
             mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)

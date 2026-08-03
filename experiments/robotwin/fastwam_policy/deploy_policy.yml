@@ -11,6 +11,9 @@ eval_num_episodes: 100
 sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
+streaming_action_enabled: false
+streaming_action_num_slots: 8
+streaming_action_chunk_size: 4
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null

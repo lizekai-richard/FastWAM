@@ -82,10 +82,16 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        trainable_params = [
+            parameter for parameter in self.model.dit.parameters() if parameter.requires_grad
+        ]
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(
+                parameter
+                for parameter in proprio_encoder.parameters()
+                if parameter.requires_grad
+            )
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -288,7 +294,18 @@ class Wan22Trainer:
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
-        model.dit.requires_grad_(True)
+        if bool(getattr(model, "streaming_action_enabled", False)):
+            # The streaming objective consumes cached video K/V but has no
+            # video reconstruction head. Keep the pretrained video prefix
+            # frozen so distributed training has no unused trainable video
+            # parameters (the final video post-block/head are intentionally
+            # absent from this action-only graph).
+            model.dit.requires_grad_(False)
+            model.video_expert.eval()
+            model.action_expert.train()
+            model.action_expert.requires_grad_(True)
+        else:
+            model.dit.requires_grad_(True)
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
@@ -425,6 +442,13 @@ class Wan22Trainer:
         
         pred_video = pred["video"]
         pred_action = pred.get("action", None)
+        if bool(getattr(model, "streaming_action_enabled", False)):
+            # `model.infer()` remains the legacy joint video rollout used for
+            # frozen-video diagnostics. Its one-shot action path does not match
+            # the rolling streaming objective, so do not publish a misleading
+            # action L1/L2 metric; streaming val_loss remains available here and
+            # closed-loop policy evaluation measures actual action quality.
+            pred_action = None
 
         # 3. inference metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
@@ -572,11 +596,15 @@ class Wan22Trainer:
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
+        model = self.accelerator.unwrap_model(self.model)
         payload = {
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        metadata_fn = getattr(model, "streaming_action_checkpoint_metadata", None)
+        if callable(metadata_fn):
+            payload["streaming_action"] = metadata_fn()
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -599,11 +627,40 @@ class Wan22Trainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+        model = self.accelerator.unwrap_model(self.model)
+        metadata_fn = getattr(model, "streaming_action_checkpoint_metadata", None)
+        expected_streaming = metadata_fn() if callable(metadata_fn) else None
+        stored_streaming = (
+            payload.get("streaming_action") if payload is not None else None
+        )
+        if expected_streaming is None:
+            if stored_streaming is not None:
+                raise ValueError(
+                    "Training state belongs to a streaming-aware FastWAM model, "
+                    "but the current model has no streaming checkpoint contract."
+                )
+        elif stored_streaming is None:
+            if expected_streaming["enabled"]:
+                raise ValueError(
+                    "Cannot resume streaming training from an Accelerate state "
+                    "without streaming objective metadata. Load its .pt weights "
+                    "as initialization instead."
+                )
+        elif stored_streaming != expected_streaming:
+            raise ValueError(
+                "Training-state streaming metadata does not match the current config: "
+                f"stored={stored_streaming}, expected={expected_streaming}."
+            )
+
+        # Load model/optimizer/scheduler only after objective compatibility has
+        # been established, so a rejected resume cannot partially mutate them.
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
 
             if "epoch" in payload and "batch_in_epoch" in payload:
