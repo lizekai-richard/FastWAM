@@ -7,13 +7,14 @@ multi-step action denoiser:
 model:
   streaming_action:
     enabled: false
-    num_slots: 8
-    chunk_size: 4
+    num_slots: 4  # rolling-buffer slots
+    chunk_size: 16
 ```
 
-`8 x 4` preserves FastWAM's current 32-action horizon. Changing either value
-changes the training and checkpoint contract; it is not an inference-only
-tuning knob.
+`chunk_size=16 x num_slots=4` matches the requested FlashVLA layout: four
+rolling-buffer slots, each containing one 16-action chunk, for a 64-action
+horizon. Changing either value changes the training and checkpoint contract;
+it is not an inference-only tuning knob.
 
 The current implementation intentionally targets base `FastWAM` only.
 `FastWAMJoint` and `FastWAMIDM` reject this switch until their paired video and
@@ -63,6 +64,13 @@ the first real chunk.
 The latency benchmark discards this cold-start phase and reports steady-state
 latency separately.
 
+With the production `16-action chunks x 4 slots` layout, this means three cold
+calls followed by the first 16-action prediction. RoboTwin currently advances
+with three safe 16-action hold chunks (48 environment steps) during that
+episode-level cold start, then replans every 16 steps in steady state. This
+control behavior must be included in closed-loop evaluation; compile warmup
+does not fill or reuse the episode buffer.
+
 FastWAM uses a shifted flow schedule (`infer_shift=5`), so slot timesteps and
 deltas must come from the scheduler's streaming slot schedule. Do not replace
 them with uniform `1 / num_slots` Euler steps copied from the original
@@ -103,6 +111,15 @@ Trainer validation continues to render the legacy joint video rollout as a
 frozen-video diagnostic, but suppresses its action L1/L2 because that one-shot
 action path is not the streaming policy. Use streaming validation loss and
 closed-loop evaluation for action quality.
+
+The regular data configs can keep their existing video observation window.
+When streaming training is enabled, the runtime requests the independent
+64-step action horizon required by `num_slots * chunk_size`; the dataset still
+uses `num_frames` to sample video/proprio observations. This avoids loading a
+65-frame video when the streaming objective consumes only its clean first
+frame. Current global normalization statistics remain reusable. This streaming
+integration requires `use_stepwise_action_norm=false`: a 64-position stepwise
+normalizer cannot directly denormalize the emitted 16-action chunk.
 
 ## Latency benchmark
 

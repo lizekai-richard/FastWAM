@@ -27,9 +27,9 @@ class BenchmarkInferenceAPITest(unittest.TestCase):
             "\nloss:\n", maxsplit=1
         )[0]
         self.assertIn("enabled: false", block)
-        self.assertIn("num_slots: 8", block)
-        self.assertIn("chunk_size: 4", block)
-        self.assertEqual(8 * 4, 32)
+        self.assertIn("num_slots: 4", block)
+        self.assertIn("chunk_size: 16", block)
+        self.assertEqual(4 * 16, 64)
         self.assertIn("torch_compile_infer_action: false", text)
         self.assertIn("torch_compile_mode: max-autotune", text)
         self.assertIn("torch_compile_dynamic: null", text)

@@ -1,7 +1,9 @@
-import torch
-import numpy as np
+from numbers import Integral
 from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
+
+import torch
+import numpy as np
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
@@ -37,7 +39,24 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
         assert past_obs_size == 0
-        assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
+        if (
+            isinstance(action_size, bool)
+            or not isinstance(action_size, Integral)
+            or action_size <= 0
+        ):
+            raise ValueError(
+                f"`action_size` must be a positive integer, got {action_size!r}"
+            )
+        if (
+            isinstance(obs_size, bool)
+            or not isinstance(obs_size, Integral)
+            or obs_size <= 0
+        ):
+            raise ValueError(
+                f"`obs_size` must be a positive integer, got {obs_size!r}"
+            )
+        action_size = int(action_size)
+        obs_size = int(obs_size)
         
         self.dataset_dirs = dataset_dirs
         self.shape_meta = shape_meta

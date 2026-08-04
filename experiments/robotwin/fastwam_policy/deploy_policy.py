@@ -197,6 +197,12 @@ class WorldActionRobotWinPolicy:
                 )
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
+        if model_streaming and bool(self.processor.use_stepwise_action_norm):
+            raise ValueError(
+                "RoboTwin streaming deployment requires global action normalization "
+                "(`use_stepwise_action_norm=false`) because each call emits one "
+                "chunk rather than the complete buffer horizon."
+            )
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
@@ -552,13 +558,26 @@ def get_model(usr_args: Dict[str, Any]):
     action_horizon = _parse_optional_int(usr_args.get("action_horizon"))
     if action_horizon is None:
         eval_horizon = _parse_optional_int(cfg.EVALUATION.get("action_horizon"))
-        action_horizon = eval_horizon if eval_horizon is not None else int(cfg.data.train.num_frames) - 1
+        if eval_horizon is not None:
+            action_horizon = eval_horizon
+        elif streaming_cfg is not None and bool(streaming_cfg.enabled):
+            # A streaming call predicts the complete rolling buffer. Do not
+            # inherit the legacy dataset horizon (currently 32) when the model
+            # contract is num_slots * chunk_size (4 * 16 = 64 by default).
+            action_horizon = int(streaming_cfg.num_slots) * int(
+                streaming_cfg.chunk_size
+            )
+        else:
+            action_horizon = int(cfg.data.train.num_frames) - 1
     if action_horizon <= 0:
         raise ValueError(f"`action_horizon` must be positive, got {action_horizon}")
 
     replan_steps = _parse_optional_int(usr_args.get("replan_steps"))
     if replan_steps is None:
-        replan_steps = int(cfg.EVALUATION.get("replan_steps", 8))
+        if streaming_cfg is not None and bool(streaming_cfg.enabled):
+            replan_steps = int(streaming_cfg.chunk_size)
+        else:
+            replan_steps = int(cfg.EVALUATION.get("replan_steps", 8))
 
     num_inference_steps = _parse_optional_int(usr_args.get("num_inference_steps"))
     if num_inference_steps is None:

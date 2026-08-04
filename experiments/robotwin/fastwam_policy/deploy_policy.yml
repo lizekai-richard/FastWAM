@@ -12,8 +12,8 @@ sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
 streaming_action_enabled: false
-streaming_action_num_slots: 8
-streaming_action_chunk_size: 4
+streaming_action_num_slots: 4  # buffer_size, measured in chunks
+streaming_action_chunk_size: 16
 torch_compile_infer_action: false
 torch_compile_mode: max-autotune
 torch_compile_dynamic: null
@@ -22,7 +22,9 @@ mixed_precision: bf16
 device: cuda
 dataset_stats_path: null
 action_horizon: null
-replan_steps: 8
+# Streaming defaults are derived from chunk_size; legacy deployment falls back
+# to the selected simulation config when this remains unset.
+replan_steps: null
 num_inference_steps: 10
 sigma_shift: null
 text_cfg_scale: 1.0

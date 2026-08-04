@@ -60,6 +60,20 @@ def test_streaming_training_batch_uses_schedule_suffixes_and_slot_times() -> Non
             assert torch.all(values < (stage + 1) / 4.0)
 
 
+def test_production_streaming_layout_is_four_16_action_slots() -> None:
+    model = _training_shell(num_slots=4, chunk_size=16)
+    action = torch.zeros(1, 64, 2)
+
+    stream = model._build_streaming_training_batch(action, action_is_pad=None)
+
+    # Four cold-start configurations, each containing the full 64-token
+    # rolling buffer, preserve the 256-token shared-observation sequence.
+    assert stream["noisy"].shape == (1, 256, 2)
+    assert stream["timestep"].shape == (1, 256)
+    assert stream["valid"].shape == (1, 256)
+    assert stream["valid"].sum().item() == 16 * (1 + 2 + 3 + 4)
+
+
 def test_streaming_training_mask_isolates_configs_padding_and_future_slots() -> None:
     model = _training_shell()
     valid = torch.tensor(
@@ -183,12 +197,12 @@ class _DummyMoT(torch.nn.Module):
         return [{"k": video_tokens + 1.0, "v": video_tokens + 2.0}]
 
 
-def _inference_shell() -> FastWAM:
+def _inference_shell(num_slots: int = 4, chunk_size: int = 2) -> FastWAM:
     model = FastWAM.__new__(FastWAM)
     torch.nn.Module.__init__(model)
     model.streaming_action_enabled = True
-    model.streaming_action_num_slots = 4
-    model.streaming_action_chunk_size = 2
+    model.streaming_action_num_slots = num_slots
+    model.streaming_action_chunk_size = chunk_size
     model.device = torch.device("cpu")
     model.torch_dtype = torch.float32
     model.proprio_dim = None
@@ -253,6 +267,32 @@ def test_public_streaming_api_keeps_state_external_and_emits_on_nth_call() -> No
         assert "Cannot change `sigma_shift`" in str(exc)
     else:
         raise AssertionError("Expected a reused state to reject a new sigma shift.")
+
+
+def test_production_streaming_layout_emits_16_actions_on_fourth_call() -> None:
+    model = _inference_shell(num_slots=4, chunk_size=16)
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    image = torch.zeros(1, 3, 16, 16)
+    context = torch.zeros(1, 2, 4)
+    context_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    state = None
+    actions = []
+    for _ in range(4):
+        result = model.infer_action_streaming(
+            prompt=None,
+            input_image=image,
+            action_horizon=64,
+            streaming_state=state,
+            action_generator=generator,
+            context=context,
+            context_mask=context_mask,
+        )
+        actions.append(result["action"])
+        state = result["streaming_state"]
+
+    assert actions[:3] == [None, None, None]
+    assert actions[3] is not None and actions[3].shape == (16, 1)
 
 
 def test_streaming_action_kernels_match_functional_buffer_transitions() -> None:

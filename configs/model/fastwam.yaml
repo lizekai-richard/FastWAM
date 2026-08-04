@@ -54,13 +54,13 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
-# FlashVLA-style streaming action decoding is opt-in. 8 slots x 4 actions
-# preserves the current 32-action horizon; enabling it requires a streaming-
-# trained checkpoint and caller-owned per-episode state.
+# FlashVLA-style streaming action decoding is opt-in. Four rolling-buffer
+# slots, each containing a 16-action chunk, give a 64-action horizon. Enabling
+# it requires a streaming-trained checkpoint and caller-owned per-episode state.
 streaming_action:
   enabled: false
-  num_slots: 8
-  chunk_size: 4
+  num_slots: 4  # buffer_size, measured in chunks
+  chunk_size: 16
 
 # The public streaming API and VAE remain eager; when enabled, torch.compile
 # wraps one fixed-shape video/MoT KV-prefill kernel plus separate cold-start and

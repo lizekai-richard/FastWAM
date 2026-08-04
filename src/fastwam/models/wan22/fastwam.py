@@ -47,8 +47,8 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         streaming_action_enabled: bool = False,
-        streaming_action_num_slots: int = 8,
-        streaming_action_chunk_size: int = 4,
+        streaming_action_num_slots: int = 4,
+        streaming_action_chunk_size: int = 16,
         torch_compile_infer_action: bool = False,
         torch_compile_mode: str = "max-autotune",
         torch_compile_dynamic: Optional[bool] = None,
@@ -174,8 +174,8 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         streaming_action_enabled: bool = False,
-        streaming_action_num_slots: int = 8,
-        streaming_action_chunk_size: int = 4,
+        streaming_action_num_slots: int = 4,
+        streaming_action_chunk_size: int = 16,
         torch_compile_infer_action: bool = False,
         torch_compile_mode: str = "max-autotune",
         torch_compile_dynamic: Optional[bool] = None,
@@ -522,9 +522,16 @@ class FastWAM(torch.nn.Module):
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
         
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         if first_frame_only:
-            input_video = input_video[:, :, :1]
+            # The streaming objective consumes only the clean visual prefix.
+            # Slice on the host so the unused rollout frames are not copied to
+            # the accelerator before VAE encoding.
+            video = video[:, :, :1]
+        input_video = video.to(
+            device=self.device,
+            dtype=self.torch_dtype,
+            non_blocking=True,
+        )
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
         first_frame_latents = None
@@ -795,9 +802,9 @@ class FastWAM(torch.nn.Module):
     def training_loss_streaming_action(self, sample, tiled: bool = False):
         """FlashVLA-style action training with a shared clean video prefix.
 
-        The existing dataset horizon is expanded in-memory into all ``N``
-        padded cold-start configurations. The video branch sees only the clean
-        first frame, exactly as base FastWAM action inference does.
+        The runtime-derived streaming horizon is expanded in-memory into all
+        ``N`` padded cold-start configurations. The video branch sees only the
+        clean first frame, exactly as base FastWAM action inference does.
         """
         inputs = self.build_inputs(sample, tiled=tiled, first_frame_only=True)
         context = inputs["context"]

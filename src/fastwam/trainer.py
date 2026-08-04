@@ -319,6 +319,8 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        action_is_pad = sample.get("action_is_pad", None)
+        image_is_pad = sample.get("image_is_pad", None)
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -358,6 +360,46 @@ class Wan22Trainer:
                 raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
             action_horizon = int(action.shape[1])
 
+        if action_is_pad is not None:
+            if not isinstance(action_is_pad, torch.Tensor):
+                raise TypeError(
+                    "`sample['action_is_pad']` must be a torch.Tensor, got "
+                    f"{type(action_is_pad)}"
+                )
+            if action_is_pad.ndim == 1:
+                action_is_pad = action_is_pad.unsqueeze(0)
+            if action_is_pad.ndim != 2:
+                raise ValueError(
+                    "`sample['action_is_pad']` must be 2D [B, T], got shape "
+                    f"{tuple(action_is_pad.shape)}"
+                )
+            if action is None or action_is_pad.shape != action.shape[:2]:
+                raise ValueError(
+                    "`sample['action_is_pad']` must match the action batch/horizon, got "
+                    f"{tuple(action_is_pad.shape)} vs "
+                    f"{None if action is None else tuple(action.shape[:2])}"
+                )
+
+        if image_is_pad is not None:
+            if not isinstance(image_is_pad, torch.Tensor):
+                raise TypeError(
+                    "`sample['image_is_pad']` must be a torch.Tensor, got "
+                    f"{type(image_is_pad)}"
+                )
+            if image_is_pad.ndim == 1:
+                image_is_pad = image_is_pad.unsqueeze(0)
+            if image_is_pad.ndim != 2:
+                raise ValueError(
+                    "`sample['image_is_pad']` must be 2D [B, T], got shape "
+                    f"{tuple(image_is_pad.shape)}"
+                )
+            expected_image_pad_shape = (video.shape[0], num_video_frames)
+            if image_is_pad.shape != expected_image_pad_shape:
+                raise ValueError(
+                    "`sample['image_is_pad']` must match the video batch/time, got "
+                    f"{tuple(image_is_pad.shape)} vs {expected_image_pad_shape}"
+                )
+
         proprio = None
         if "proprio" in sample:
             proprio = sample["proprio"]
@@ -388,6 +430,8 @@ class Wan22Trainer:
             "context": context,
             "context_mask": context_mask,
             "action_horizon": action_horizon,
+            "action_is_pad": action_is_pad,
+            "image_is_pad": image_is_pad,
         }
 
     @torch.no_grad()

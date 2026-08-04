@@ -788,18 +788,17 @@ def main() -> None:
             f"Requested samples [{sample_start}, {sample_end}) exceed dataset length {len(dataset)}."
         )
 
-    action_horizon = int(cfg.data.train.num_frames) - 1
+    data_action_horizon = int(cfg.data.train.num_frames) - 1
     num_video_frames = (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
     streaming_num_slots = int(cfg.model.streaming_action.num_slots)
     streaming_chunk_size = int(cfg.model.streaming_action.chunk_size)
     if args.inference_mode == "streaming":
-        configured_horizon = streaming_num_slots * streaming_chunk_size
-        if configured_horizon != action_horizon:
-            raise ValueError(
-                "Streaming buffer must cover the dataset action horizon exactly: "
-                f"num_slots({streaming_num_slots}) * chunk_size({streaming_chunk_size}) "
-                f"= {configured_horizon}, action_horizon={action_horizon}."
-            )
+        # Streaming inference consumes only the sample's initial image/proprio;
+        # its action shape is the rolling buffer contract, not the dataset's
+        # supervised action-label horizon.
+        action_horizon = streaming_num_slots * streaming_chunk_size
+    else:
+        action_horizon = data_action_horizon
 
     model = _load_model(
         cfg=cfg,

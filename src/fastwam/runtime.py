@@ -168,8 +168,8 @@ def create_fastwam(
         action_infer_shift=float(action_scheduler["infer_shift"]),
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         streaming_action_enabled=bool(streaming_action.get("enabled", False)),
-        streaming_action_num_slots=int(streaming_action.get("num_slots", 8)),
-        streaming_action_chunk_size=int(streaming_action.get("chunk_size", 4)),
+        streaming_action_num_slots=int(streaming_action.get("num_slots", 4)),
+        streaming_action_chunk_size=int(streaming_action.get("chunk_size", 16)),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         torch_compile_infer_action=bool(torch_compile_infer_action),
@@ -355,8 +355,20 @@ def create_fastwam_idm(
     )
 
 
-def build_datasets(data_cfg: DictConfig):
-    train_ds = instantiate(data_cfg.train)
+def build_datasets(data_cfg: DictConfig, action_horizon: int | None = None):
+    dataset_kwargs = {}
+    if action_horizon is not None:
+        if (
+            isinstance(action_horizon, bool)
+            or not isinstance(action_horizon, int)
+            or action_horizon <= 0
+        ):
+            raise ValueError(
+                f"`action_horizon` must be a positive integer, got {action_horizon!r}"
+            )
+        dataset_kwargs["action_horizon"] = action_horizon
+
+    train_ds = instantiate(data_cfg.train, **dataset_kwargs)
     if data_cfg.get("val") is None:
         val_ds = train_ds
     else:
@@ -365,7 +377,11 @@ def build_datasets(data_cfg: DictConfig):
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
         pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
         logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-        val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
+        val_ds = instantiate(
+            data_cfg.val,
+            pretrained_norm_stats=pretrained_norm_stats,
+            **dataset_kwargs,
+        )
     return train_ds, val_ds
 
 
@@ -395,7 +411,34 @@ def run_training(cfg: DictConfig):
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    train_ds, val_ds = build_datasets(cfg.data)
+    action_horizon = None
+    if bool(getattr(model, "streaming_action_enabled", False)):
+        num_slots = int(model.streaming_action_num_slots)
+        chunk_size = int(model.streaming_action_chunk_size)
+        action_horizon = num_slots * chunk_size
+        for split_name in ("train", "val"):
+            split_cfg = cfg.data.get(split_name)
+            if split_cfg is None:
+                continue
+            processor_cfg = split_cfg.get("processor")
+            if (
+                processor_cfg is not None
+                and bool(processor_cfg.get("use_stepwise_action_norm", False))
+            ):
+                raise ValueError(
+                    "Streaming action currently requires global action normalization "
+                    "(`use_stepwise_action_norm=false`): the rolling buffer emits "
+                    f"one chunk at a time, but data.{split_name}.processor enables "
+                    "stepwise normalization."
+                )
+        logger.info(
+            "Streaming action training: overriding dataset action horizon to "
+            "%d (%d slots x %d actions)",
+            action_horizon,
+            num_slots,
+            chunk_size,
+        )
+    train_ds, val_ds = build_datasets(cfg.data, action_horizon=action_horizon)
 
     trainer = Wan22Trainer(
         cfg=cfg,
