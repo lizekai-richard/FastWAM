@@ -676,8 +676,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Enable max-autotune torch.compile. Legacy mode compiles infer_action; "
-            "streaming mode keeps its public wrapper eager and compiles separate "
-            "fixed-shape cold-start/steady action kernels. Compile time is paid during warmup."
+            "streaming mode keeps VAE/public orchestration eager and compiles a fixed-shape "
+            "video/MoT KV-prefill kernel plus cold-start/steady action kernels. Compile time "
+            "is paid during warmup."
         ),
     )
     parser.add_argument(
@@ -691,7 +692,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Run an additional instrumented pass reporting only video KV prefill "
             "(including image VAE encoding) and full action prediction/denoising. "
-            "Streaming mode retains the compiled action kernels when enabled."
+            "Streaming mode retains the compiled video/MoT prefill and action "
+            "kernels when enabled."
         ),
     )
     parser.add_argument(
@@ -1047,9 +1049,22 @@ def main() -> None:
                 "The model must emit both named stages; the benchmark never derives or estimates either "
                 "stage from end-to-end latency. Host-side argument/state validation, caller RNG/noise "
                 "preparation, and output D2H are excluded. Streaming compile keeps these events around "
-                "the same compiled action kernel used by canonical latency; legacy whole-method compile "
-                "uses its explicit eager-instrumented companion for the breakdown."
+                "the same compiled video/MoT prefill and action kernels used by canonical latency; "
+                "the VAE remains eager. Legacy whole-method compile uses its explicit "
+                "eager-instrumented companion for the breakdown."
             ),
+            "stage_execution_modes": {
+                "video_kv_prefill": (
+                    "eager_vae_with_compiled_video_mot_prefill"
+                    if compile_execution.scope == "streaming_inference_kernels"
+                    else "eager_instrumented"
+                ),
+                "action_prediction": (
+                    "compiled"
+                    if compile_execution.scope == "streaming_inference_kernels"
+                    else "eager_instrumented"
+                ),
+            },
             "stage_definitions": {
                 "video_kv_prefill": (
                     "Image device transfer, VAE encoding, conditioning, video token/mask preparation, "
@@ -1141,7 +1156,7 @@ def main() -> None:
     }
 
     result = {
-        "schema_version": "3.1",
+        "schema_version": "3.2",
         "preset": preset.name,
         "num_views": int(args.num_views),
         "task": preset.task,
@@ -1181,6 +1196,9 @@ def main() -> None:
             "profiled_execution_mode": compile_execution.profiled_execution_mode,
             "public_wrapper_execution_mode": (
                 compile_execution.public_wrapper_execution_mode
+            ),
+            "video_prefill_core_execution_mode": (
+                compile_execution.video_prefill_core_execution_mode
             ),
             "action_core_execution_mode": compile_execution.action_core_execution_mode,
             "mode": getattr(model, "torch_compile_mode", None) if args.torch_compile else None,

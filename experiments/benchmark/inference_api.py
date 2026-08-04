@@ -12,7 +12,7 @@ INFERENCE_MODES = ("legacy", "streaming")
 COMPILE_SCOPES = (
     "none",
     "legacy_infer_action",
-    "streaming_action_kernels",
+    "streaming_inference_kernels",
 )
 
 
@@ -36,6 +36,7 @@ class CompileExecution:
     canonical_execution_mode: str
     profiled_execution_mode: str
     public_wrapper_execution_mode: str
+    video_prefill_core_execution_mode: str
     action_core_execution_mode: str
     profiled_matches_canonical: bool
 
@@ -54,6 +55,7 @@ def describe_compile_execution(model: Any, mode: str) -> CompileExecution:
             canonical_execution_mode="eager",
             profiled_execution_mode="eager_instrumented",
             public_wrapper_execution_mode="eager",
+            video_prefill_core_execution_mode="eager",
             action_core_execution_mode="eager",
             profiled_matches_canonical=True,
         )
@@ -67,10 +69,10 @@ def describe_compile_execution(model: Any, mode: str) -> CompileExecution:
         raise RuntimeError(
             f"Legacy inference requires compile scope 'legacy_infer_action', got {scope!r}."
         )
-    if mode == "streaming" and scope != "streaming_action_kernels":
+    if mode == "streaming" and scope != "streaming_inference_kernels":
         raise RuntimeError(
             "Streaming inference requires compile scope "
-            f"'streaming_action_kernels', got {scope!r}."
+            f"'streaming_inference_kernels', got {scope!r}."
         )
 
     if scope == "legacy_infer_action":
@@ -80,6 +82,7 @@ def describe_compile_execution(model: Any, mode: str) -> CompileExecution:
             canonical_execution_mode="compiled_public_method",
             profiled_execution_mode="eager_instrumented",
             public_wrapper_execution_mode="compiled",
+            video_prefill_core_execution_mode="compiled",
             action_core_execution_mode="compiled",
             profiled_matches_canonical=False,
         )
@@ -87,9 +90,10 @@ def describe_compile_execution(model: Any, mode: str) -> CompileExecution:
     return CompileExecution(
         enabled=True,
         scope=scope,
-        canonical_execution_mode="eager_wrapper_with_compiled_action_kernels",
-        profiled_execution_mode="eager_wrapper_with_compiled_action_kernels_instrumented",
+        canonical_execution_mode="eager_wrapper_with_compiled_streaming_kernels",
+        profiled_execution_mode="eager_wrapper_with_compiled_streaming_kernels_instrumented",
         public_wrapper_execution_mode="eager",
+        video_prefill_core_execution_mode="compiled",
         action_core_execution_mode="compiled",
         profiled_matches_canonical=True,
     )

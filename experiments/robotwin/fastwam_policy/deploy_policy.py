@@ -264,22 +264,23 @@ class WorldActionRobotWinPolicy:
             )
 
     def _warmup_streaming_compile(self) -> None:
-        """Capture both static streaming kernels before the first rollout."""
+        """Capture all static streaming kernels before the first rollout."""
         if not self.streaming_action_enabled or not bool(
             getattr(self.model, "torch_compile_infer_action", False)
         ):
             return
         if getattr(self.model, "torch_compile_scope", "none") != (
-            "streaming_action_kernels"
+            "streaming_inference_kernels"
         ):
             raise RuntimeError(
-                "Streaming compile is enabled without the expected cold/steady "
-                "action-kernel compile scope."
+                "Streaming compile is enabled without the expected video-prefill "
+                "and cold/steady action-kernel compile scope."
             )
 
         logger.info(
-            "Warming FlashVLA-style streaming compile graphs (%d cold/steady calls).",
-            int(self.model.streaming_action_num_slots) + 1,
+            "Warming FlashVLA-style video-prefill and action compile graphs "
+            "(%d streaming calls).",
+            int(self.model.streaming_action_num_slots) + 2,
         )
         image = torch.zeros(
             (1, 3, 384, 320),
@@ -296,7 +297,7 @@ class WorldActionRobotWinPolicy:
         generator = torch.Generator(device=self.rand_device).manual_seed(0)
         state = None
         with torch.inference_mode():
-            for _ in range(int(self.model.streaming_action_num_slots) + 1):
+            for _ in range(int(self.model.streaming_action_num_slots) + 2):
                 result = self.model.infer_action_streaming(
                     prompt=DEFAULT_PROMPT.format(task="compile warmup"),
                     input_image=image,

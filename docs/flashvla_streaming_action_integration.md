@@ -122,9 +122,10 @@ python experiments/benchmark/benchmark_inference_latency.py \
   --checkpoint /path/to/streaming-trained.pt
 ```
 
-Add `--torch-compile` to benchmark FlashVLA-style compiled streaming action
-kernels. The benchmark primes every cold-start phase and steady state before
-recording canonical latency, so first-use compilation is excluded.
+Add `--torch-compile` to benchmark FlashVLA-style compiled streaming inference
+kernels. The benchmark primes the video/MoT prefill, every cold-start phase,
+and steady state before recording canonical latency, so first-use compilation
+is excluded.
 
 RoboTwin deployment is enabled end to end with the regular Hydra entrypoint:
 
@@ -147,23 +148,26 @@ Both reports use the same boundaries:
 
 Legacy inference retains whole-method `infer_action` compilation. Streaming
 mode follows FlashVLA's different structure: the public
-`infer_action_streaming` dispatcher remains eager, while fixed-shape
-`_streaming_action_cold_start_kernel` and
-`_streaming_action_steady_kernel` methods are compiled separately. The two
-kernels cover ActionDiT/MoT action prediction, the FP32 scheduler update, and
-the cold append or steady emit/shift/append transition. Caller-owned random
-sampling, state validation, prompt/proprio preparation, and output D2H remain
-outside the graph.
+`infer_action_streaming` dispatcher remains eager, while three fixed-shape
+methods are compiled separately: `_streaming_video_kv_prefill_kernel`,
+`_streaming_action_cold_start_kernel`, and
+`_streaming_action_steady_kernel`. The two action kernels cover ActionDiT/MoT
+action prediction, the FP32 scheduler update, and the cold append or steady
+emit/shift/append transition. Caller-owned random sampling, state validation,
+prompt/proprio preparation, and output D2H remain outside the graph.
 
-Wan VAE encoding and video KV prefill intentionally remain eager. The current
-VAE mutates Python feature-cache lists during `encode`, so placing it inside a
-CUDA graph would introduce graph breaks or unsafe replay. This boundary also
-lets the two-stage profiler put CUDA events around the same compiled action
-kernel used by canonical streaming latency.
+Wan VAE encoding intentionally remains eager. The current VAE mutates Python
+feature-cache lists during `encode`, so placing it inside a CUDA graph would
+introduce graph breaks or unsafe replay. Its latent tensor feeds the compiled
+video kernel, which covers VideoDiT token preparation and the MoT transformer
+pass that materializes the per-layer vision K/V cache. The two-stage profiler
+therefore measures eager VAE plus compiled vision prefill as one
+`video_kv_prefill` stage and the same compiled action kernel used by canonical
+streaming latency as `action_prediction`.
 
 The default streaming compile settings match FlashVLA: `max-autotune`, static
 shape specialization, and CUDA graphs enabled. Batch size, image resolution,
 context length, proprio presence, action horizon, and dtype should therefore
-stay fixed during a deployment. RoboTwin performs `num_slots + 1` dummy calls
-at startup to capture one cold graph and warm two steady invocations, then
-resets rollout state and RNG before the first episode.
+stay fixed during a deployment. RoboTwin performs `num_slots + 2` dummy calls
+at startup to capture the vision graph, one cold graph, and warm two steady
+replays, then resets rollout state and RNG before the first episode.

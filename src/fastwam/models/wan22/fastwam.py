@@ -336,14 +336,16 @@ class FastWAM(torch.nn.Module):
         torch.set_float32_matmul_precision("high")
         compile_kwargs = self._torch_compile_kwargs()
         if self.streaming_action_enabled:
-            # Match FlashVLA's eager dispatcher + two fixed-shape compiled
-            # kernels. Generator sampling, rollout-state validation, VAE/video
-            # prefill, and output D2H remain outside Dynamo.
+            # Match FlashVLA's eager dispatcher with fixed-shape compiled
+            # inference kernels. The stateful VAE remains eager; its tensor
+            # output then flows through one compiled video/MoT prefill kernel
+            # and one of the compiled cold/steady action kernels.
             method_names = (
+                "_streaming_video_kv_prefill_kernel",
                 "_streaming_action_cold_start_kernel",
                 "_streaming_action_steady_kernel",
             )
-            self.torch_compile_scope = "streaming_action_kernels"
+            self.torch_compile_scope = "streaming_inference_kernels"
         else:
             method_names = ("infer_action",)
             self.torch_compile_scope = "legacy_infer_action"
@@ -1179,6 +1181,55 @@ class FastWAM(torch.nn.Module):
         return self.action_expert.post_dit(action_tokens, action_pre)
 
     @torch.no_grad()
+    def _streaming_video_kv_prefill_kernel(
+        self,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> list[dict[str, torch.Tensor]]:
+        """Tokenize VAE latents and run the tensor-only MoT video prefix.
+
+        Wan VAE encoding stays in the eager dispatcher because its encoder
+        mutates Python feature-cache lists. Everything after that boundary is
+        fixed-shape tensor work and is safe to specialize and CUDA-graph.
+        The returned cache is consumed immediately by the action kernel in the
+        same control step; it is never persisted as caller-owned state.
+        """
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=first_frame_latents.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=bool(
+                getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
+            ),
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        video_tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        video_attention_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=video_attention_mask,
+        )
+        return video_kv_cache
+
+    @torch.no_grad()
     def _streaming_action_denoise_buffer(
         self,
         buffer: torch.Tensor,
@@ -1828,10 +1879,6 @@ class FastWAM(torch.nn.Module):
             input_image=input_image,
             tiled=tiled,
         )
-        fuse_flag = bool(
-            getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
-        )
-
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -1871,34 +1918,41 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
-        timestep_video = torch.zeros(
-            (batch_size,),
-            dtype=first_frame_latents.dtype,
-            device=self.device,
-        )
-        video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
-            timestep=timestep_video,
+        if (
+            self.device.type == "cuda"
+            and bool(getattr(self, "torch_compile_infer_action", False))
+            and not bool(getattr(self, "torch_compile_disable_cudagraphs", True))
+        ):
+            # One control step invokes the compiled video graph followed by a
+            # compiled action graph. Mark only the outer step so the cache
+            # remains live across that parent/child CUDA-graph boundary.
+            mark_step_begin = getattr(
+                getattr(torch, "compiler", None),
+                "cudagraph_mark_step_begin",
+                None,
+            )
+            if mark_step_begin is None:
+                raise RuntimeError(
+                    "Streaming CUDA-graph compile requires "
+                    "torch.compiler.cudagraph_mark_step_begin()."
+                )
+            mark_step_begin()
+        video_kv_cache = self._streaming_video_kv_prefill_kernel(
+            first_frame_latents=first_frame_latents,
             context=context,
             context_mask=context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=fuse_flag,
         )
-        video_seq_len = int(video_pre["tokens"].shape[1])
-        video_attention_mask = self.video_expert.build_video_to_video_mask(
-            video_seq_len=video_seq_len,
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_pre["tokens"].device,
-        )
-        video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
-            },
-            video_attention_mask=video_attention_mask,
+        if not video_kv_cache:
+            raise RuntimeError(
+                "Compiled video prefill returned an empty MoT K/V cache."
+            )
+        video_seq_len = int(video_kv_cache[0]["k"].shape[1])
+        patch_h = int(self.video_expert.patch_size[1])
+        patch_w = int(self.video_expert.patch_size[2])
+        video_tokens_per_frame = (
+            int(first_frame_latents.shape[3]) // patch_h
+        ) * (
+            int(first_frame_latents.shape[4]) // patch_w
         )
         if latency_recorder is not None:
             latency_recorder.stop("video_kv_prefill")
@@ -1937,7 +1991,7 @@ class FastWAM(torch.nn.Module):
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=action_horizon,
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            video_tokens_per_frame=video_tokens_per_frame,
             device=self.device,
             action_attention_mask=action_attention_mask,
         )

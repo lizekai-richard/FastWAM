@@ -52,14 +52,15 @@ class BenchmarkInferenceAPITest(unittest.TestCase):
 
         class Model:
             torch_compile_infer_action = True
-            torch_compile_scope = "streaming_action_kernels"
+            torch_compile_scope = "streaming_inference_kernels"
 
         execution = api.describe_compile_execution(Model(), "streaming")
         self.assertEqual(
             execution.canonical_execution_mode,
-            "eager_wrapper_with_compiled_action_kernels",
+            "eager_wrapper_with_compiled_streaming_kernels",
         )
         self.assertEqual(execution.public_wrapper_execution_mode, "eager")
+        self.assertEqual(execution.video_prefill_core_execution_mode, "compiled")
         self.assertEqual(execution.action_core_execution_mode, "compiled")
         self.assertTrue(execution.profiled_matches_canonical)
 
@@ -80,6 +81,7 @@ class BenchmarkInferenceAPITest(unittest.TestCase):
 
         eager = api.describe_compile_execution(Eager(), "streaming")
         self.assertEqual(eager.canonical_execution_mode, "eager")
+        self.assertEqual(eager.video_prefill_core_execution_mode, "eager")
         self.assertEqual(eager.action_core_execution_mode, "eager")
         self.assertTrue(eager.profiled_matches_canonical)
 

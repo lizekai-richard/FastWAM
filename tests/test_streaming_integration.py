@@ -125,17 +125,44 @@ class _DummyActionExpert(torch.nn.Module):
 class _DummyVideoExpert(torch.nn.Module):
     video_attention_mask_mode = "first_frame_causal"
     fuse_vae_embedding_in_latents = False
+    patch_size = (1, 1, 1)
 
     def pre_dit(self, x, timestep, context, context_mask, action, **kwargs):
         del timestep, action, kwargs
         batch_size = x.shape[0]
+        patch_h = int(self.patch_size[1])
+        patch_w = int(self.patch_size[2])
+        tokens_per_frame = (x.shape[3] // patch_h) * (x.shape[4] // patch_w)
+        video_seq_len = x.shape[2] * tokens_per_frame
         return {
-            "tokens": torch.zeros(batch_size, 1, 4),
-            "freqs": torch.zeros(1, 1, 1, dtype=torch.complex64),
-            "t_mod": torch.zeros(batch_size, 6, 4),
+            "tokens": torch.zeros(
+                batch_size,
+                video_seq_len,
+                4,
+                device=x.device,
+                dtype=x.dtype,
+            ),
+            "freqs": torch.zeros(
+                video_seq_len,
+                1,
+                1,
+                device=x.device,
+                dtype=torch.complex64,
+            ),
+            "t_mod": torch.zeros(
+                batch_size,
+                6,
+                4,
+                device=x.device,
+                dtype=x.dtype,
+            ),
             "context": context,
-            "context_mask": context_mask[:, None, :],
-            "meta": {"tokens_per_frame": 1},
+            "context_mask": context_mask[:, None, :].expand(
+                -1,
+                video_seq_len,
+                -1,
+            ),
+            "meta": {"tokens_per_frame": tokens_per_frame},
         }
 
     def build_video_to_video_mask(self, video_seq_len, **kwargs):
@@ -151,9 +178,9 @@ class _DummyVAE(torch.nn.Module):
 
 
 class _DummyMoT(torch.nn.Module):
-    def prefill_video_cache(self, **kwargs):
+    def prefill_video_cache(self, video_tokens, **kwargs):
         del kwargs
-        return []
+        return [{"k": video_tokens + 1.0, "v": video_tokens + 2.0}]
 
 
 def _inference_shell() -> FastWAM:
@@ -321,7 +348,79 @@ def test_streaming_dispatch_clones_compiled_kernel_state_outputs() -> None:
     assert next_state.valid_mask.data_ptr() != kernel_valid.data_ptr()
 
 
-def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> None:
+def test_streaming_video_prefill_kernel_starts_after_vae_latents() -> None:
+    model = _inference_shell()
+    latents = torch.full((1, 1, 1, 1, 1), 3.0)
+    context = torch.zeros(1, 2, 4)
+    context_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    cache = model._streaming_video_kv_prefill_kernel(
+        first_frame_latents=latents,
+        context=context,
+        context_mask=context_mask,
+    )
+
+    assert len(cache) == 1
+    torch.testing.assert_close(cache[0]["k"], torch.ones(1, 1, 4))
+    torch.testing.assert_close(cache[0]["v"], torch.full((1, 1, 4), 2.0))
+
+
+def test_streaming_video_prefill_kernel_is_fullgraph_compilable() -> None:
+    model = _inference_shell()
+    compiled = torch.compile(
+        model._streaming_video_kv_prefill_kernel,
+        backend="eager",
+        fullgraph=True,
+    )
+    try:
+        cache = compiled(
+            first_frame_latents=torch.zeros(1, 1, 1, 1, 1),
+            context=torch.zeros(1, 2, 4),
+            context_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+    finally:
+        torch._dynamo.reset()
+
+    assert len(cache) == 1
+    torch.testing.assert_close(cache[0]["k"], torch.ones(1, 1, 4))
+
+
+def test_streaming_video_layout_uses_latent_patch_geometry() -> None:
+    model = _inference_shell()
+    model.video_expert.patch_size = (1, 2, 3)
+    model._encode_input_image_latents_tensor = lambda **kwargs: torch.zeros(
+        1,
+        1,
+        1,
+        4,
+        9,
+    )
+    observed = {}
+    build_attention_mask = model._build_mot_attention_mask
+
+    def capture_layout(**kwargs):
+        observed["video_seq_len"] = kwargs["video_seq_len"]
+        observed["video_tokens_per_frame"] = kwargs["video_tokens_per_frame"]
+        return build_attention_mask(**kwargs)
+
+    model._build_mot_attention_mask = capture_layout
+    state = model.initialize_action_stream_state(torch.zeros(1, 2, 1))
+    model.infer_action_stream_step(
+        prompt=None,
+        input_image=torch.zeros(1, 3, 16, 16),
+        state=state,
+        new_noise=torch.ones(1, 2, 1),
+        context=torch.zeros(1, 2, 4),
+        context_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+
+    assert observed == {
+        "video_seq_len": 6,
+        "video_tokens_per_frame": 6,
+    }
+
+
+def test_streaming_compile_wraps_prefill_cold_and_steady_kernels_not_public_api() -> None:
     model = _inference_shell()
     model.torch_compile_infer_action = True
     model.torch_compile_mode = "max-autotune"
@@ -332,6 +431,7 @@ def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> Non
     model.torch_compile_scope = "none"
 
     compile_calls = []
+    execution_calls = []
     original_compile = torch.compile
     original_precision = torch.get_float32_matmul_precision()
     public_streaming_func = model.infer_action_streaming.__func__
@@ -340,6 +440,7 @@ def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> Non
         compile_calls.append((method.__name__, kwargs))
 
         def wrapped(*args, **call_kwargs):
+            execution_calls.append(method.__name__)
             return method(*args, **call_kwargs)
 
         return wrapped
@@ -352,15 +453,18 @@ def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> Non
         torch.set_float32_matmul_precision(original_precision)
 
     assert [name for name, _ in compile_calls] == [
+        "_streaming_video_kv_prefill_kernel",
         "_streaming_action_cold_start_kernel",
         "_streaming_action_steady_kernel",
     ]
     assert all(kwargs == {"mode": "max-autotune"} for _, kwargs in compile_calls)
     assert model.infer_action_streaming.__func__ is public_streaming_func
+    assert callable(model._streaming_video_kv_prefill_kernel_eager)
     assert callable(model._streaming_action_cold_start_kernel_eager)
     assert callable(model._streaming_action_steady_kernel_eager)
-    assert model.torch_compile_scope == "streaming_action_kernels"
+    assert model.torch_compile_scope == "streaming_inference_kernels"
     assert model.torch_compile_targets == [
+        "FastWAM._streaming_video_kv_prefill_kernel",
         "FastWAM._streaming_action_cold_start_kernel",
         "FastWAM._streaming_action_steady_kernel",
     ]
@@ -388,6 +492,41 @@ def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> Non
     assert actions[3] is not None and actions[4] is not None
     assert state.buffer.dtype == torch.float32
     assert state.steps.dtype == torch.int64
+    assert execution_calls.count("_streaming_video_kv_prefill_kernel") == 5
+    assert execution_calls.count("_streaming_action_cold_start_kernel") == 3
+    assert execution_calls.count("_streaming_action_steady_kernel") == 2
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def start(self, name):
+            self.calls.append(("start", name))
+
+        def stop(self, name):
+            self.calls.append(("stop", name))
+
+    recorder = Recorder()
+    profiled = model.infer_action_streaming_profiled(
+        latency_recorder=recorder,
+        prompt=None,
+        input_image=image,
+        action_horizon=8,
+        streaming_state=state,
+        action_generator=generator,
+        context=context,
+        context_mask=context_mask,
+    )
+    assert profiled["action"] is not None
+    assert execution_calls.count("_streaming_video_kv_prefill_kernel") == 6
+    assert execution_calls.count("_streaming_action_cold_start_kernel") == 3
+    assert execution_calls.count("_streaming_action_steady_kernel") == 3
+    assert recorder.calls == [
+        ("start", "video_kv_prefill"),
+        ("stop", "video_kv_prefill"),
+        ("start", "action_prediction"),
+        ("stop", "action_prediction"),
+    ]
 
 
 def test_legacy_compile_keeps_profiled_eager_alias() -> None:
