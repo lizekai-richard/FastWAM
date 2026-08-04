@@ -39,6 +39,8 @@ wandb:
   name: train
   group: null
   mode: online
+  id: null
+  resume: null
 
 hydra:
   job:

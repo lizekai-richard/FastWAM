@@ -150,6 +150,10 @@ class Wan22Trainer:
             name=self.cfg.wandb.name,
             group=None if self.cfg.wandb.group in (None, "null", "") else str(self.cfg.wandb.group),
             mode=self.cfg.wandb.mode,
+            id=None if self.cfg.wandb.id in (None, "null", "") else str(self.cfg.wandb.id),
+            resume=None
+            if self.cfg.wandb.resume in (None, "null", "")
+            else self.cfg.wandb.resume,
             dir=self.output_dir,
         )
         logger.info(
