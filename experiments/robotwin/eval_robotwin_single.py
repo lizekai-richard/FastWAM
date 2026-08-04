@@ -225,6 +225,19 @@ def main(cfg: DictConfig):
             "streaming_action_chunk_size",
             streaming_cfg.chunk_size,
         )
+    for compile_key in (
+        "torch_compile_infer_action",
+        "torch_compile_mode",
+        "torch_compile_dynamic",
+        "torch_compile_disable_cudagraphs",
+    ):
+        if compile_key in cfg.model:
+            _append_override(
+                overrides,
+                compile_key,
+                cfg.model.get(compile_key),
+                skip_none=False,
+            )
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)

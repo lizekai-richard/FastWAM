@@ -93,8 +93,8 @@ def create_fastwam(
     streaming_action=None,
     torch_compile_infer_action: bool = False,
     torch_compile_mode: str = "max-autotune",
-    torch_compile_dynamic: bool | None = True,
-    torch_compile_disable_cudagraphs: bool = True,
+    torch_compile_dynamic: bool | None = None,
+    torch_compile_disable_cudagraphs: bool | None = None,
 ):
     from .models.wan22.fastwam import FastWAM
 
@@ -175,7 +175,11 @@ def create_fastwam(
         torch_compile_infer_action=bool(torch_compile_infer_action),
         torch_compile_mode=str(torch_compile_mode),
         torch_compile_dynamic=torch_compile_dynamic,
-        torch_compile_disable_cudagraphs=bool(torch_compile_disable_cudagraphs),
+        torch_compile_disable_cudagraphs=(
+            None
+            if torch_compile_disable_cudagraphs is None
+            else bool(torch_compile_disable_cudagraphs)
+        ),
     )
 
 

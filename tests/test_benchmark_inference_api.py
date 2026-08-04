@@ -30,6 +30,10 @@ class BenchmarkInferenceAPITest(unittest.TestCase):
         self.assertIn("num_slots: 8", block)
         self.assertIn("chunk_size: 4", block)
         self.assertEqual(8 * 4, 32)
+        self.assertIn("torch_compile_infer_action: false", text)
+        self.assertIn("torch_compile_mode: max-autotune", text)
+        self.assertIn("torch_compile_dynamic: null", text)
+        self.assertIn("torch_compile_disable_cudagraphs: null", text)
 
     def test_benchmark_cli_declares_explicit_inference_mode(self) -> None:
         source = (
@@ -41,6 +45,78 @@ class BenchmarkInferenceAPITest(unittest.TestCase):
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
         self.assertIn("--inference-mode", constants)
+        self.assertIn("--torch-compile", constants)
+
+    def test_compile_execution_reports_streaming_core_scope(self) -> None:
+        api = _load_api_module()
+
+        class Model:
+            torch_compile_infer_action = True
+            torch_compile_scope = "streaming_action_kernels"
+
+        execution = api.describe_compile_execution(Model(), "streaming")
+        self.assertEqual(
+            execution.canonical_execution_mode,
+            "eager_wrapper_with_compiled_action_kernels",
+        )
+        self.assertEqual(execution.public_wrapper_execution_mode, "eager")
+        self.assertEqual(execution.action_core_execution_mode, "compiled")
+        self.assertTrue(execution.profiled_matches_canonical)
+
+    def test_compile_execution_distinguishes_legacy_profiled_companion(self) -> None:
+        api = _load_api_module()
+
+        class LegacyCompiled:
+            torch_compile_infer_action = True
+            torch_compile_scope = "legacy_infer_action"
+
+        compiled = api.describe_compile_execution(LegacyCompiled(), "legacy")
+        self.assertEqual(compiled.public_wrapper_execution_mode, "compiled")
+        self.assertFalse(compiled.profiled_matches_canonical)
+
+        class Eager:
+            torch_compile_infer_action = False
+            torch_compile_scope = "none"
+
+        eager = api.describe_compile_execution(Eager(), "streaming")
+        self.assertEqual(eager.canonical_execution_mode, "eager")
+        self.assertEqual(eager.action_core_execution_mode, "eager")
+        self.assertTrue(eager.profiled_matches_canonical)
+
+    def test_compile_execution_rejects_scope_mode_mismatch(self) -> None:
+        api = _load_api_module()
+
+        class WrongScope:
+            torch_compile_infer_action = True
+            torch_compile_scope = "legacy_infer_action"
+
+        with self.assertRaisesRegex(RuntimeError, "Streaming inference requires"):
+            api.describe_compile_execution(WrongScope(), "streaming")
+
+    def test_robotwin_forwards_compile_settings_with_unsupported_model_guard(self) -> None:
+        deploy_yml = (
+            ROOT / "experiments" / "robotwin" / "fastwam_policy" / "deploy_policy.yml"
+        ).read_text(encoding="utf-8")
+        launcher = (
+            ROOT / "experiments" / "robotwin" / "eval_robotwin_single.py"
+        ).read_text(encoding="utf-8")
+        policy = (
+            ROOT
+            / "experiments"
+            / "robotwin"
+            / "fastwam_policy"
+            / "deploy_policy.py"
+        ).read_text(encoding="utf-8")
+        for key in (
+            "torch_compile_infer_action",
+            "torch_compile_mode",
+            "torch_compile_dynamic",
+            "torch_compile_disable_cudagraphs",
+        ):
+            self.assertIn(key, deploy_yml)
+            self.assertIn(key, launcher)
+            self.assertIn(key, policy)
+        self.assertIn('compile_supported = "torch_compile_infer_action" in cfg.model', policy)
 
     def test_streaming_api_is_required_without_legacy_fallback(self) -> None:
         api = _load_api_module()

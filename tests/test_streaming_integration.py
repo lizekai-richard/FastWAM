@@ -7,6 +7,11 @@ from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.schedulers.scheduler_continuous import (
     WanContinuousFlowMatchScheduler,
 )
+from fastwam.models.wan22.streaming_action import (
+    append_cold_start_noise,
+    emit_shift_append_action_buffer,
+    update_action_buffer,
+)
 
 
 def _training_shell(num_slots: int = 4, chunk_size: int = 2) -> FastWAM:
@@ -223,14 +228,218 @@ def test_public_streaming_api_keeps_state_external_and_emits_on_nth_call() -> No
         raise AssertionError("Expected a reused state to reject a new sigma shift.")
 
 
-def test_streaming_public_api_compile_fails_fast_instead_of_graph_breaking() -> None:
+def test_streaming_action_kernels_match_functional_buffer_transitions() -> None:
     model = _inference_shell()
+    buffer = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1)
+    valid_mask = torch.tensor(
+        [[True, True, False, False, False, False, False, False]]
+    )
+    new_noise = torch.tensor([[[20.0], [21.0]]])
+    timestep = torch.zeros(1, 8)
+    delta = torch.full((1, 8), -0.25)
+    context = torch.zeros(1, 2, 4)
+    context_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    expected_updated = update_action_buffer(
+        buffer=buffer,
+        token_delta=torch.full_like(buffer, -0.25),
+        valid_mask=valid_mask,
+    )
+    expected_cold, expected_valid = append_cold_start_noise(
+        buffer=expected_updated,
+        new_noise=new_noise,
+        valid_mask=valid_mask,
+        chunk_size=2,
+    )
+    cold, cold_valid = model._streaming_action_cold_start_kernel(
+        buffer=buffer,
+        valid_mask=valid_mask,
+        new_noise=new_noise,
+        timestep_action=timestep,
+        delta_action=delta,
+        context=context,
+        context_mask=context_mask,
+        video_kv_cache=[],
+        attention_mask=torch.ones(8, 8, dtype=torch.bool),
+        video_seq_len=0,
+    )
+    torch.testing.assert_close(cold, expected_cold)
+    torch.testing.assert_close(cold_valid, expected_valid)
+
+    full_valid = torch.ones_like(valid_mask)
+    expected_full_updated = update_action_buffer(
+        buffer=buffer,
+        token_delta=torch.full_like(buffer, -0.25),
+        valid_mask=full_valid,
+    )
+    expected_emitted, expected_steady = emit_shift_append_action_buffer(
+        updated_buffer=expected_full_updated,
+        new_noise=new_noise,
+        chunk_size=2,
+    )
+    emitted, steady, steady_valid = model._streaming_action_steady_kernel(
+        buffer=buffer,
+        valid_mask=full_valid,
+        new_noise=new_noise,
+        timestep_action=timestep,
+        delta_action=delta,
+        context=context,
+        context_mask=context_mask,
+        video_kv_cache=[],
+        attention_mask=torch.ones(8, 8, dtype=torch.bool),
+        video_seq_len=0,
+    )
+    torch.testing.assert_close(emitted, expected_emitted)
+    torch.testing.assert_close(steady, expected_steady)
+    assert steady_valid.all()
+
+
+def test_streaming_dispatch_clones_compiled_kernel_state_outputs() -> None:
+    model = _inference_shell()
+    state = model.initialize_action_stream_state(torch.zeros(1, 2, 1))
+    kernel_buffer = torch.arange(8, dtype=torch.float32).reshape(1, 8, 1)
+    kernel_valid = torch.tensor(
+        [[True, True, True, True, False, False, False, False]]
+    )
+    model._streaming_action_cold_start_kernel = lambda **kwargs: (
+        kernel_buffer,
+        kernel_valid,
+    )
+
+    result = model.infer_action_stream_step(
+        prompt=None,
+        input_image=torch.zeros(1, 3, 16, 16),
+        state=state,
+        new_noise=torch.ones(1, 2, 1),
+        context=torch.zeros(1, 2, 4),
+        context_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+    next_state = result["state"]
+    torch.testing.assert_close(next_state.buffer, kernel_buffer)
+    torch.testing.assert_close(next_state.valid_mask, kernel_valid)
+    assert next_state.buffer.data_ptr() != kernel_buffer.data_ptr()
+    assert next_state.valid_mask.data_ptr() != kernel_valid.data_ptr()
+
+
+def test_streaming_compile_wraps_cold_and_steady_kernels_not_public_api() -> None:
+    model = _inference_shell()
+    model.torch_compile_infer_action = True
+    model.torch_compile_mode = "max-autotune"
+    model.torch_compile_dynamic = None
+    model.torch_compile_disable_cudagraphs = False
+    model.torch_compile_options = None
+    model.torch_compile_targets = []
+    model.torch_compile_scope = "none"
+
+    compile_calls = []
+    original_compile = torch.compile
+    original_precision = torch.get_float32_matmul_precision()
+    public_streaming_func = model.infer_action_streaming.__func__
+
+    def fake_compile(method, **kwargs):
+        compile_calls.append((method.__name__, kwargs))
+
+        def wrapped(*args, **call_kwargs):
+            return method(*args, **call_kwargs)
+
+        return wrapped
+
     try:
+        torch.compile = fake_compile
         model._compile_infer_action_entrypoint()
-    except RuntimeError as exc:
-        assert "not supported" in str(exc)
-    else:
-        raise AssertionError("Expected whole-method streaming compile to be rejected.")
+    finally:
+        torch.compile = original_compile
+        torch.set_float32_matmul_precision(original_precision)
+
+    assert [name for name, _ in compile_calls] == [
+        "_streaming_action_cold_start_kernel",
+        "_streaming_action_steady_kernel",
+    ]
+    assert all(kwargs == {"mode": "max-autotune"} for _, kwargs in compile_calls)
+    assert model.infer_action_streaming.__func__ is public_streaming_func
+    assert callable(model._streaming_action_cold_start_kernel_eager)
+    assert callable(model._streaming_action_steady_kernel_eager)
+    assert model.torch_compile_scope == "streaming_action_kernels"
+    assert model.torch_compile_targets == [
+        "FastWAM._streaming_action_cold_start_kernel",
+        "FastWAM._streaming_action_steady_kernel",
+    ]
+
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    image = torch.zeros(1, 3, 16, 16)
+    context = torch.zeros(1, 2, 4)
+    context_mask = torch.ones(1, 2, dtype=torch.bool)
+    state = None
+    actions = []
+    for _ in range(5):
+        result = model.infer_action_streaming(
+            prompt=None,
+            input_image=image,
+            action_horizon=8,
+            streaming_state=state,
+            action_generator=generator,
+            context=context,
+            context_mask=context_mask,
+        )
+        actions.append(result["action"])
+        state = result["streaming_state"]
+
+    assert actions[:3] == [None, None, None]
+    assert actions[3] is not None and actions[4] is not None
+    assert state.buffer.dtype == torch.float32
+    assert state.steps.dtype == torch.int64
+
+
+def test_legacy_compile_keeps_profiled_eager_alias() -> None:
+    model = _inference_shell()
+    model.streaming_action_enabled = False
+    model.torch_compile_infer_action = True
+    model.torch_compile_mode = "max-autotune"
+    model.torch_compile_dynamic = None
+    model.torch_compile_disable_cudagraphs = False
+    model.torch_compile_options = None
+    model.torch_compile_targets = []
+    model.torch_compile_scope = "none"
+
+    compile_calls = []
+    original_compile = torch.compile
+    original_precision = torch.get_float32_matmul_precision()
+
+    def fake_compile(method, **kwargs):
+        compile_calls.append((method.__name__, kwargs))
+        return method
+
+    try:
+        torch.compile = fake_compile
+        model._compile_infer_action_entrypoint()
+    finally:
+        torch.compile = original_compile
+        torch.set_float32_matmul_precision(original_precision)
+
+    assert compile_calls == [("infer_action", {"mode": "max-autotune"})]
+    assert callable(model._infer_action_eager)
+    assert model.torch_compile_scope == "legacy_infer_action"
+    assert model.torch_compile_targets == ["FastWAM.infer_action"]
+
+
+def test_compile_defaults_resolve_by_inference_mode() -> None:
+    def construct(*, streaming: bool) -> FastWAM:
+        return FastWAM(
+            video_expert=torch.nn.Linear(2, 2),
+            action_expert=torch.nn.Linear(2, 2),
+            mot=torch.nn.Linear(2, 2),
+            vae=torch.nn.Linear(2, 2),
+            text_dim=4,
+            streaming_action_enabled=streaming,
+        )
+
+    legacy = construct(streaming=False)
+    assert legacy.torch_compile_dynamic is True
+    assert legacy.torch_compile_disable_cudagraphs is True
+
+    streaming = construct(streaming=True)
+    assert streaming.torch_compile_dynamic is None
+    assert streaming.torch_compile_disable_cudagraphs is False
 
 
 def test_streaming_constructor_requires_one_train_infer_shift_contract() -> None:

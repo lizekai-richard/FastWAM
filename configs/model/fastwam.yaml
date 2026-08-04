@@ -62,5 +62,14 @@ streaming_action:
   num_slots: 8
   chunk_size: 4
 
+# The public streaming API remains eager; when enabled, torch.compile wraps
+# separate fixed-shape cold-start and steady-state action kernels. These
+# null options resolve by inference mode: legacy preserves dynamic graphs with
+# CUDA graphs disabled; streaming uses FlashVLA's static CUDA-graph execution.
+torch_compile_infer_action: false
+torch_compile_mode: max-autotune
+torch_compile_dynamic: null
+torch_compile_disable_cudagraphs: null
+
 loss:
   lambda_action: 1.0

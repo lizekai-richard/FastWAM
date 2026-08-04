@@ -9,6 +9,11 @@ from typing import Any
 
 
 INFERENCE_MODES = ("legacy", "streaming")
+COMPILE_SCOPES = (
+    "none",
+    "legacy_infer_action",
+    "streaming_action_kernels",
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,72 @@ class InferenceAPI:
     @property
     def stateful(self) -> bool:
         return self.mode == "streaming"
+
+
+@dataclass(frozen=True)
+class CompileExecution:
+    enabled: bool
+    scope: str
+    canonical_execution_mode: str
+    profiled_execution_mode: str
+    public_wrapper_execution_mode: str
+    action_core_execution_mode: str
+    profiled_matches_canonical: bool
+
+
+def describe_compile_execution(model: Any, mode: str) -> CompileExecution:
+    """Describe model-level compile scope without guessing from method names."""
+    if mode not in INFERENCE_MODES:
+        raise ValueError(f"Unsupported inference mode {mode!r}; expected one of {INFERENCE_MODES}.")
+
+    enabled = bool(getattr(model, "torch_compile_infer_action", False))
+    scope = str(getattr(model, "torch_compile_scope", "none"))
+    if not enabled:
+        return CompileExecution(
+            enabled=False,
+            scope="none",
+            canonical_execution_mode="eager",
+            profiled_execution_mode="eager_instrumented",
+            public_wrapper_execution_mode="eager",
+            action_core_execution_mode="eager",
+            profiled_matches_canonical=True,
+        )
+
+    if scope not in COMPILE_SCOPES or scope == "none":
+        raise RuntimeError(
+            "torch.compile is enabled but the model did not expose a supported "
+            f"compile scope, got {scope!r}."
+        )
+    if mode == "legacy" and scope != "legacy_infer_action":
+        raise RuntimeError(
+            f"Legacy inference requires compile scope 'legacy_infer_action', got {scope!r}."
+        )
+    if mode == "streaming" and scope != "streaming_action_kernels":
+        raise RuntimeError(
+            "Streaming inference requires compile scope "
+            f"'streaming_action_kernels', got {scope!r}."
+        )
+
+    if scope == "legacy_infer_action":
+        return CompileExecution(
+            enabled=True,
+            scope=scope,
+            canonical_execution_mode="compiled_public_method",
+            profiled_execution_mode="eager_instrumented",
+            public_wrapper_execution_mode="compiled",
+            action_core_execution_mode="compiled",
+            profiled_matches_canonical=False,
+        )
+
+    return CompileExecution(
+        enabled=True,
+        scope=scope,
+        canonical_execution_mode="eager_wrapper_with_compiled_action_kernels",
+        profiled_execution_mode="eager_wrapper_with_compiled_action_kernels_instrumented",
+        public_wrapper_execution_mode="eager",
+        action_core_execution_mode="compiled",
+        profiled_matches_canonical=True,
+    )
 
 
 def _require_callable(model: Any, name: str) -> Callable[..., Any]:

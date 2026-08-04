@@ -14,6 +14,10 @@ sim_cfg_name: sim_robotwin.yaml
 streaming_action_enabled: false
 streaming_action_num_slots: 8
 streaming_action_chunk_size: 4
+torch_compile_infer_action: false
+torch_compile_mode: max-autotune
+torch_compile_dynamic: null
+torch_compile_disable_cudagraphs: null
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null

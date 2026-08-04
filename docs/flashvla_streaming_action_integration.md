@@ -122,13 +122,18 @@ python experiments/benchmark/benchmark_inference_latency.py \
   --checkpoint /path/to/streaming-trained.pt
 ```
 
+Add `--torch-compile` to benchmark FlashVLA-style compiled streaming action
+kernels. The benchmark primes every cold-start phase and steady state before
+recording canonical latency, so first-use compilation is excluded.
+
 RoboTwin deployment is enabled end to end with the regular Hydra entrypoint:
 
 ```bash
 python experiments/robotwin/eval_robotwin_single.py \
   ckpt=/path/to/streaming-trained.pt \
   EVALUATION.task_name=click_alarmclock \
-  model.streaming_action.enabled=true
+  model.streaming_action.enabled=true \
+  model.torch_compile_infer_action=true
 ```
 
 Both reports use the same boundaries:
@@ -138,7 +143,27 @@ Both reports use the same boundaries:
 2. `action_prediction`: legacy full denoising loop, or one streaming rolling-
    buffer prediction/update. Output device-to-host transfer is excluded.
 
-Whole-method `torch.compile` remains available for legacy inference. Streaming
-mode currently rejects that option because its caller-owned generator and
-Python state transitions graph-break; streaming latency is therefore reported
-honestly in eager mode until the tensor-only step core is compiled separately.
+## `torch.compile` boundary
+
+Legacy inference retains whole-method `infer_action` compilation. Streaming
+mode follows FlashVLA's different structure: the public
+`infer_action_streaming` dispatcher remains eager, while fixed-shape
+`_streaming_action_cold_start_kernel` and
+`_streaming_action_steady_kernel` methods are compiled separately. The two
+kernels cover ActionDiT/MoT action prediction, the FP32 scheduler update, and
+the cold append or steady emit/shift/append transition. Caller-owned random
+sampling, state validation, prompt/proprio preparation, and output D2H remain
+outside the graph.
+
+Wan VAE encoding and video KV prefill intentionally remain eager. The current
+VAE mutates Python feature-cache lists during `encode`, so placing it inside a
+CUDA graph would introduce graph breaks or unsafe replay. This boundary also
+lets the two-stage profiler put CUDA events around the same compiled action
+kernel used by canonical streaming latency.
+
+The default streaming compile settings match FlashVLA: `max-autotune`, static
+shape specialization, and CUDA graphs enabled. Batch size, image resolution,
+context length, proprio presence, action horizon, and dtype should therefore
+stay fixed during a deployment. RoboTwin performs `num_slots + 1` dummy calls
+at startup to capture one cold graph and warm two steady invocations, then
+resets rollout state and RNG before the first episode.

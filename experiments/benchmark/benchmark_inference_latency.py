@@ -55,6 +55,7 @@ try:  # Support both direct script execution and module-style test imports.
         INFERENCE_MODES,
         InferenceAPI,
         accepts_keyword,
+        describe_compile_execution,
         resolve_inference_api,
         unpack_inference_result,
     )
@@ -63,6 +64,7 @@ except ImportError:
         INFERENCE_MODES,
         InferenceAPI,
         accepts_keyword,
+        describe_compile_execution,
         resolve_inference_api,
         unpack_inference_result,
     )
@@ -672,7 +674,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-compile",
         action="store_true",
-        help="Enable model-level torch.compile for infer_action with max-autotune. Compile time is paid during warmup.",
+        help=(
+            "Enable max-autotune torch.compile. Legacy mode compiles infer_action; "
+            "streaming mode keeps its public wrapper eager and compiles separate "
+            "fixed-shape cold-start/steady action kernels. Compile time is paid during warmup."
+        ),
     )
     parser.add_argument(
         "--include-text-encoder",
@@ -683,8 +689,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--latency-breakdown",
         action="store_true",
         help=(
-            "Run an additional eager-instrumented pass reporting only video KV prefill "
-            "(including image VAE encoding) and full action prediction/denoising."
+            "Run an additional instrumented pass reporting only video KV prefill "
+            "(including image VAE encoding) and full action prediction/denoising. "
+            "Streaming mode retains the compiled action kernels when enabled."
         ),
     )
     parser.add_argument(
@@ -742,8 +749,14 @@ def main() -> None:
     cfg.model.streaming_action.enabled = args.inference_mode == "streaming"
     cfg.model.torch_compile_infer_action = bool(args.torch_compile)
     cfg.model.torch_compile_mode = "max-autotune"
-    cfg.model.torch_compile_dynamic = True
-    cfg.model.torch_compile_disable_cudagraphs = True
+    if args.inference_mode == "streaming":
+        # Match FlashVLA's static max-autotune graphs. The benchmark primes all
+        # cold phases and steady state before recording canonical latency.
+        cfg.model.torch_compile_dynamic = None
+        cfg.model.torch_compile_disable_cudagraphs = False
+    else:
+        cfg.model.torch_compile_dynamic = True
+        cfg.model.torch_compile_disable_cudagraphs = True
     if dataset_dir is not None and preset.dataset_loader == "base_lerobot":
         cfg.data.train.dataset_dirs = [str(dataset_dir)]
 
@@ -801,6 +814,7 @@ def main() -> None:
         args.inference_mode,
         require_profiled=bool(args.latency_breakdown),
     )
+    compile_execution = describe_compile_execution(model, args.inference_mode)
 
     benchmark_inputs: list[dict[str, Any]] = []
     for sample_idx in range(sample_start, sample_end):
@@ -1011,14 +1025,6 @@ def main() -> None:
                 normalized["sample_index"] = sample_index
                 profiled_calls.append(normalized)
 
-        canonical_is_compiled = bool(
-            args.torch_compile
-            and any(
-                target == inference_api.canonical_name
-                or target.endswith(f".{inference_api.canonical_name}")
-                for target in compile_targets
-            )
-        )
         action_stage_definition = (
             "Inference schedule construction plus the full iterative ActionDiT denoising loop, "
             "including scheduler updates; output D2H is excluded"
@@ -1031,15 +1037,18 @@ def main() -> None:
         latency_breakdown = {
             "enabled": True,
             "inference_mode": args.inference_mode,
-            "execution_mode": "eager_instrumented",
-            "canonical_latency_execution_mode": "compiled" if canonical_is_compiled else "eager",
-            "same_execution_path_as_canonical_latency": not canonical_is_compiled,
+            "execution_mode": compile_execution.profiled_execution_mode,
+            "canonical_latency_execution_mode": compile_execution.canonical_execution_mode,
+            "same_execution_path_as_canonical_latency": (
+                compile_execution.profiled_matches_canonical
+            ),
             "measurement_note": (
                 "CUDA stages use events on the current stream with one synchronization at call end. "
                 "The model must emit both named stages; the benchmark never derives or estimates either "
                 "stage from end-to-end latency. Host-side argument/state validation, caller RNG/noise "
-                "preparation, and output D2H are excluded. A compiled canonical method is profiled "
-                "through its explicit eager-instrumented companion."
+                "preparation, and output D2H are excluded. Streaming compile keeps these events around "
+                "the same compiled action kernel used by canonical latency; legacy whole-method compile "
+                "uses its explicit eager-instrumented companion for the breakdown."
             ),
             "stage_definitions": {
                 "video_kv_prefill": (
@@ -1132,7 +1141,7 @@ def main() -> None:
     }
 
     result = {
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "preset": preset.name,
         "num_views": int(args.num_views),
         "task": preset.task,
@@ -1166,7 +1175,14 @@ def main() -> None:
         "streaming_action": streaming_result,
         "torch_compile": {
             "enabled": bool(getattr(model, "torch_compile_infer_action", False)),
+            "scope": compile_execution.scope,
             "canonical_method": inference_api.canonical_name,
+            "canonical_execution_mode": compile_execution.canonical_execution_mode,
+            "profiled_execution_mode": compile_execution.profiled_execution_mode,
+            "public_wrapper_execution_mode": (
+                compile_execution.public_wrapper_execution_mode
+            ),
+            "action_core_execution_mode": compile_execution.action_core_execution_mode,
             "mode": getattr(model, "torch_compile_mode", None) if args.torch_compile else None,
             "dynamic": getattr(model, "torch_compile_dynamic", None) if args.torch_compile else None,
             "disable_cudagraphs": getattr(model, "torch_compile_disable_cudagraphs", None)

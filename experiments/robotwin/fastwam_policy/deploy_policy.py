@@ -241,13 +241,15 @@ class WorldActionRobotWinPolicy:
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
-            "horizon=%d | replan=%d | streaming=%s",
+            "horizon=%d | replan=%d | streaming=%s | compile_scope=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
             self.streaming_action_enabled,
+            getattr(self.model, "torch_compile_scope", "none"),
         )
+        self._warmup_streaming_compile()
 
     def _reset_streaming_generator(self) -> None:
         if not self.streaming_action_enabled:
@@ -260,6 +262,61 @@ class WorldActionRobotWinPolicy:
             self._streaming_generator.manual_seed(
                 int(self.seed) + int(self.episode_count)
             )
+
+    def _warmup_streaming_compile(self) -> None:
+        """Capture both static streaming kernels before the first rollout."""
+        if not self.streaming_action_enabled or not bool(
+            getattr(self.model, "torch_compile_infer_action", False)
+        ):
+            return
+        if getattr(self.model, "torch_compile_scope", "none") != (
+            "streaming_action_kernels"
+        ):
+            raise RuntimeError(
+                "Streaming compile is enabled without the expected cold/steady "
+                "action-kernel compile scope."
+            )
+
+        logger.info(
+            "Warming FlashVLA-style streaming compile graphs (%d cold/steady calls).",
+            int(self.model.streaming_action_num_slots) + 1,
+        )
+        image = torch.zeros(
+            (1, 3, 384, 320),
+            device=self.model.device,
+            dtype=self.model.torch_dtype,
+        )
+        proprio = None
+        if self.model.proprio_dim is not None:
+            proprio = torch.zeros(
+                (1, int(self.model.proprio_dim)),
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+            )
+        generator = torch.Generator(device=self.rand_device).manual_seed(0)
+        state = None
+        with torch.inference_mode():
+            for _ in range(int(self.model.streaming_action_num_slots) + 1):
+                result = self.model.infer_action_streaming(
+                    prompt=DEFAULT_PROMPT.format(task="compile warmup"),
+                    input_image=image,
+                    action_horizon=self.action_horizon,
+                    streaming_state=state,
+                    action_generator=generator,
+                    proprio=proprio,
+                    negative_prompt=self.negative_prompt,
+                    text_cfg_scale=self.text_cfg_scale,
+                    num_inference_steps=1,
+                    sigma_shift=self.sigma_shift,
+                    rand_device=self.rand_device,
+                    tiled=self.tiled,
+                )
+                state = result["streaming_state"]
+        if self.model.device.type == "cuda":
+            torch.cuda.synchronize(self.model.device)
+        self.streaming_action_state = None
+        self._reset_streaming_generator()
+        logger.info("Streaming compile warmup complete; rollout state/RNG reset.")
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
         state_meta = self.processor.shape_meta["state"]
@@ -325,7 +382,7 @@ class WorldActionRobotWinPolicy:
             "tiled": self.tiled,
         }
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
-        with torch.no_grad():
+        with torch.inference_mode():
             if self.streaming_action_enabled:
                 if self._streaming_generator is None:
                     raise RuntimeError("Streaming action generator was not initialized.")
@@ -446,6 +503,34 @@ def get_model(usr_args: Dict[str, Any]):
             streaming_cfg.num_slots = int(streaming_num_slots)
         if not _is_none_like(streaming_chunk_size):
             streaming_cfg.chunk_size = int(streaming_chunk_size)
+
+    compile_enabled = usr_args.get("torch_compile_infer_action")
+    compile_mode = usr_args.get("torch_compile_mode")
+    compile_dynamic = usr_args.get("torch_compile_dynamic")
+    compile_disable_cudagraphs = usr_args.get(
+        "torch_compile_disable_cudagraphs"
+    )
+    compile_supported = "torch_compile_infer_action" in cfg.model
+    if not compile_supported:
+        if (
+            not _is_none_like(compile_enabled)
+            and _parse_bool(compile_enabled)
+        ):
+            raise ValueError(
+                "The selected model does not support torch-compiled action "
+                "inference. Use the base FastWAM model config."
+            )
+    else:
+        if not _is_none_like(compile_enabled):
+            cfg.model.torch_compile_infer_action = _parse_bool(compile_enabled)
+        if not _is_none_like(compile_mode):
+            cfg.model.torch_compile_mode = str(compile_mode)
+        if not _is_none_like(compile_dynamic):
+            cfg.model.torch_compile_dynamic = _parse_bool(compile_dynamic)
+        if not _is_none_like(compile_disable_cudagraphs):
+            cfg.model.torch_compile_disable_cudagraphs = _parse_bool(
+                compile_disable_cudagraphs
+            )
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):

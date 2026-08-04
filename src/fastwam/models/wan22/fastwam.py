@@ -14,12 +14,9 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .streaming_action import (
     StreamingActionState,
-    append_cold_start_noise,
     cold_start_token_values,
-    emit_shift_append_action_buffer,
     initialize_streaming_action_state,
     slot_block_causal_action_mask,
-    update_action_buffer,
     validate_streaming_config,
 )
 
@@ -54,8 +51,8 @@ class FastWAM(torch.nn.Module):
         streaming_action_chunk_size: int = 4,
         torch_compile_infer_action: bool = False,
         torch_compile_mode: str = "max-autotune",
-        torch_compile_dynamic: Optional[bool] = True,
-        torch_compile_disable_cudagraphs: bool = True,
+        torch_compile_dynamic: Optional[bool] = None,
+        torch_compile_disable_cudagraphs: Optional[bool] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -133,12 +130,19 @@ class FastWAM(torch.nn.Module):
             )
         self.torch_compile_infer_action = bool(torch_compile_infer_action)
         self.torch_compile_mode = str(torch_compile_mode)
-        self.torch_compile_dynamic = torch_compile_dynamic
-        self.torch_compile_disable_cudagraphs = bool(
-            torch_compile_disable_cudagraphs
+        self.torch_compile_dynamic = (
+            (None if self.streaming_action_enabled else True)
+            if torch_compile_dynamic is None
+            else bool(torch_compile_dynamic)
+        )
+        self.torch_compile_disable_cudagraphs = (
+            (False if self.streaming_action_enabled else True)
+            if torch_compile_disable_cudagraphs is None
+            else bool(torch_compile_disable_cudagraphs)
         )
         self.torch_compile_options: Optional[dict[str, Any]] = None
         self.torch_compile_targets: list[str] = []
+        self.torch_compile_scope = "none"
         self.loaded_checkpoint_streaming_action: Optional[dict[str, Any]] = None
 
         self.to(self.device)
@@ -174,8 +178,8 @@ class FastWAM(torch.nn.Module):
         streaming_action_chunk_size: int = 4,
         torch_compile_infer_action: bool = False,
         torch_compile_mode: str = "max-autotune",
-        torch_compile_dynamic: Optional[bool] = True,
-        torch_compile_disable_cudagraphs: bool = True,
+        torch_compile_dynamic: Optional[bool] = None,
+        torch_compile_disable_cudagraphs: Optional[bool] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -290,7 +294,9 @@ class FastWAM(torch.nn.Module):
         if not hasattr(torch, "compile"):
             raise RuntimeError("This PyTorch build does not provide torch.compile.")
 
-        kwargs: dict[str, Any] = {"dynamic": self.torch_compile_dynamic}
+        kwargs: dict[str, Any] = {}
+        if self.torch_compile_dynamic is not None:
+            kwargs["dynamic"] = self.torch_compile_dynamic
         mode = self.torch_compile_mode
         if self.torch_compile_disable_cudagraphs:
             options: dict[str, Any] = {}
@@ -326,29 +332,42 @@ class FastWAM(torch.nn.Module):
         return kwargs
 
     def _compile_infer_action_entrypoint(self) -> None:
-        if self.streaming_action_enabled:
-            raise RuntimeError(
-                "`torch_compile_infer_action=true` is not supported for the "
-                "caller-stateful streaming API yet. Compiling the public method "
-                "would graph-break on Generator sampling and state transitions; "
-                "leave it disabled for honest streaming latency measurements."
-            )
         self._prepare_compile_inputs()
-        method_name = "infer_action"
-        eager_method = getattr(self, method_name)
-        setattr(self, f"_{method_name}_eager", eager_method)
-        compiled_method = torch.compile(eager_method, **self._torch_compile_kwargs())
-        setattr(self, method_name, compiled_method)
-        target = f"{self.__class__.__name__}.{method_name}"
-        self.torch_compile_targets.append(target)
-        logger.info(
-            "Enabled torch.compile for %s with mode=%s dynamic=%s "
-            "disable_cudagraphs=%s.",
-            target,
-            self.torch_compile_mode,
-            self.torch_compile_dynamic,
-            self.torch_compile_disable_cudagraphs,
-        )
+        torch.set_float32_matmul_precision("high")
+        compile_kwargs = self._torch_compile_kwargs()
+        if self.streaming_action_enabled:
+            # Match FlashVLA's eager dispatcher + two fixed-shape compiled
+            # kernels. Generator sampling, rollout-state validation, VAE/video
+            # prefill, and output D2H remain outside Dynamo.
+            method_names = (
+                "_streaming_action_cold_start_kernel",
+                "_streaming_action_steady_kernel",
+            )
+            self.torch_compile_scope = "streaming_action_kernels"
+        else:
+            method_names = ("infer_action",)
+            self.torch_compile_scope = "legacy_infer_action"
+
+        for method_name in method_names:
+            eager_method = getattr(self, method_name)
+            eager_alias = (
+                "_infer_action_eager"
+                if method_name == "infer_action"
+                else f"{method_name}_eager"
+            )
+            setattr(self, eager_alias, eager_method)
+            compiled_method = torch.compile(eager_method, **compile_kwargs)
+            setattr(self, method_name, compiled_method)
+            target = f"{self.__class__.__name__}.{method_name}"
+            self.torch_compile_targets.append(target)
+            logger.info(
+                "Enabled torch.compile for %s with mode=%s dynamic=%s "
+                "disable_cudagraphs=%s.",
+                target,
+                self.torch_compile_mode,
+                self.torch_compile_dynamic,
+                self.torch_compile_disable_cudagraphs,
+            )
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -1160,6 +1179,119 @@ class FastWAM(torch.nn.Module):
         return self.action_expert.post_dit(action_tokens, action_pre)
 
     @torch.no_grad()
+    def _streaming_action_denoise_buffer(
+        self,
+        buffer: torch.Tensor,
+        valid_mask: torch.Tensor,
+        timestep_action: torch.Tensor,
+        delta_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        """Run one tensor-only action prediction/update over the rolling buffer."""
+        pred_action = self._predict_action_noise_with_cache(
+            latents_action=buffer.to(dtype=self.torch_dtype),
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        updated = buffer + pred_action.float() * delta_action.float().unsqueeze(-1)
+        return torch.where(valid_mask.unsqueeze(-1), updated, buffer)
+
+    @torch.no_grad()
+    def _streaming_action_cold_start_kernel(
+        self,
+        buffer: torch.Tensor,
+        valid_mask: torch.Tensor,
+        new_noise: torch.Tensor,
+        timestep_action: torch.Tensor,
+        delta_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cold-start tensor kernel compiled once for every tensor-valued stage.
+
+        The eager caller validates shapes/state and constructs the tensor-valued
+        timestep, delta, and validity inputs. This kernel contains no random
+        sampling or Python rollout state, so every cold-start phase reuses one
+        fixed-shape Dynamo graph just like FlashVLA's compiled ``_cold_start``.
+        """
+        updated_buffer = self._streaming_action_denoise_buffer(
+            buffer=buffer,
+            valid_mask=valid_mask,
+            timestep_action=timestep_action,
+            delta_action=delta_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+
+        batch_size, horizon, action_dim = buffer.shape
+        num_slots = self.streaming_action_num_slots
+        chunk_size = self.streaming_action_chunk_size
+        slot_valid = valid_mask.reshape(batch_size, num_slots, chunk_size).all(dim=2)
+        first_invalid = (~slot_valid).to(dtype=torch.int64).argmax(dim=1)
+        slot_index = torch.arange(num_slots, device=buffer.device)
+        target_slots = slot_index.unsqueeze(0) == first_invalid.unsqueeze(1)
+        target_tokens = target_slots.repeat_interleave(chunk_size, dim=1)
+        tiled_noise = (
+            new_noise.float()
+            .unsqueeze(1)
+            .expand(-1, num_slots, -1, -1)
+            .reshape(batch_size, horizon, action_dim)
+        )
+        next_buffer = torch.where(
+            target_tokens.unsqueeze(-1), tiled_noise, updated_buffer
+        )
+        next_valid_mask = valid_mask | target_tokens
+        return next_buffer, next_valid_mask
+
+    @torch.no_grad()
+    def _streaming_action_steady_kernel(
+        self,
+        buffer: torch.Tensor,
+        valid_mask: torch.Tensor,
+        new_noise: torch.Tensor,
+        timestep_action: torch.Tensor,
+        delta_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fixed-shape steady-state action kernel for CUDA-graph replay."""
+        updated_buffer = self._streaming_action_denoise_buffer(
+            buffer=buffer,
+            valid_mask=valid_mask,
+            timestep_action=timestep_action,
+            delta_action=delta_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        chunk_size = self.streaming_action_chunk_size
+        emitted = updated_buffer[:, :chunk_size, :].clone()
+        next_buffer = torch.cat(
+            (updated_buffer[:, chunk_size:, :], new_noise.float()), dim=1
+        )
+        next_valid_mask = torch.ones_like(valid_mask)
+        return emitted, next_buffer, next_valid_mask
+
+    @torch.no_grad()
     def infer_joint(
         self,
         prompt: Optional[str],
@@ -1658,6 +1790,7 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 "Streaming valid_mask is inconsistent with state.steps; reset or restore both together."
             )
+        buffer_was_full = bool(state.valid_mask.all().item())
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -1808,39 +1941,43 @@ class FastWAM(torch.nn.Module):
             device=self.device,
             action_attention_mask=action_attention_mask,
         )
-        pred_action = self._predict_action_noise_with_cache(
-            latents_action=state.buffer.to(dtype=self.torch_dtype),
-            timestep_action=timestep_action,
-            context=context,
-            context_mask=context_mask,
-            video_kv_cache=video_kv_cache,
-            attention_mask=attention_mask,
-            video_seq_len=video_seq_len,
-        )
-        token_delta = pred_action.float() * delta_action.float().unsqueeze(-1)
-        updated_buffer = update_action_buffer(
-            buffer=state.buffer,
-            token_delta=token_delta,
-            valid_mask=state.valid_mask,
-        )
-
-        buffer_was_full = bool(state.valid_mask.all().item())
         emitted: Optional[torch.Tensor]
         if buffer_was_full:
-            emitted, next_buffer = emit_shift_append_action_buffer(
-                updated_buffer=updated_buffer,
-                new_noise=new_noise,
-                chunk_size=self.streaming_action_chunk_size,
+            emitted, next_buffer, next_valid_mask = (
+                self._streaming_action_steady_kernel(
+                    buffer=state.buffer,
+                    valid_mask=state.valid_mask,
+                    new_noise=new_noise,
+                    timestep_action=timestep_action,
+                    delta_action=delta_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
             )
-            next_valid_mask = torch.ones_like(state.valid_mask)
         else:
             emitted = None
-            next_buffer, next_valid_mask = append_cold_start_noise(
-                buffer=updated_buffer,
-                new_noise=new_noise,
-                valid_mask=state.valid_mask,
-                chunk_size=self.streaming_action_chunk_size,
+            next_buffer, next_valid_mask = (
+                self._streaming_action_cold_start_kernel(
+                    buffer=state.buffer,
+                    valid_mask=state.valid_mask,
+                    new_noise=new_noise,
+                    timestep_action=timestep_action,
+                    delta_action=delta_action,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
             )
+        # CUDA-graph outputs use replay-owned storage. Persist caller-owned
+        # state in ordinary eager allocations so a later cold/steady replay
+        # cannot overwrite this rollout (or another interleaved rollout).
+        next_buffer = next_buffer.clone()
+        next_valid_mask = next_valid_mask.clone()
         next_state = StreamingActionState(
             buffer=next_buffer,
             valid_mask=next_valid_mask,
