@@ -18,10 +18,14 @@ def _checkpoint_shell(*, enabled: bool, num_slots: int = 4) -> FastWAM:
     model.mot = torch.nn.Linear(2, 2)
     model.video_expert = torch.nn.Linear(2, 2)
     model.proprio_encoder = None
+    model.vae = type("VAE", (), {"temporal_downsample_factor": 4})()
     model.torch_dtype = torch.float32
+    model.loss_lambda_video = 1.0
+    model.loss_lambda_action = 1.0
     model.streaming_action_enabled = enabled
     model.streaming_action_num_slots = num_slots
     model.streaming_action_chunk_size = 2
+    model.train_video_scheduler = WanContinuousFlowMatchScheduler(shift=5.0)
     model.train_action_scheduler = WanContinuousFlowMatchScheduler(shift=5.0)
     model.infer_action_scheduler = WanContinuousFlowMatchScheduler(shift=5.0)
     model.loaded_checkpoint_streaming_action = None
@@ -38,9 +42,14 @@ class StreamingCheckpointTests(unittest.TestCase):
             payload = target.load_checkpoint(path)
 
         metadata = payload["streaming_action"]
-        self.assertEqual(metadata["objective"], "flashvla_action_streaming_v1")
+        self.assertEqual(
+            metadata["objective"],
+            "flashvla_video_action_streaming_v2",
+        )
         self.assertEqual(metadata["num_slots"], 4)
         self.assertEqual(metadata["chunk_size"], 2)
+        self.assertEqual(metadata["video_temporal_downsample_factor"], 4)
+        self.assertEqual(metadata["video_num_train_timesteps"], 1000)
         self.assertEqual(metadata["action_num_train_timesteps"], 1000)
         self.assertEqual(target.loaded_checkpoint_streaming_action, metadata)
 

@@ -12,6 +12,7 @@ from fastwam.models.wan22.streaming_action import (
     emit_shift_append_action_buffer,
     update_action_buffer,
 )
+from fastwam.trainer import Wan22Trainer
 
 
 def _training_shell(num_slots: int = 4, chunk_size: int = 2) -> FastWAM:
@@ -195,6 +196,218 @@ class _DummyMoT(torch.nn.Module):
     def prefill_video_cache(self, video_tokens, **kwargs):
         del kwargs
         return [{"k": video_tokens + 1.0, "v": video_tokens + 2.0}]
+
+
+class _DummyJointVideoExpert(torch.nn.Module):
+    fuse_vae_embedding_in_latents = True
+    patch_size = (1, 1, 1)
+
+    def __init__(self, attention_mode: str = "first_frame_causal") -> None:
+        super().__init__()
+        self.video_attention_mask_mode = attention_mode
+        self.bias = torch.nn.Parameter(torch.tensor(2.0))
+
+    def pre_dit(self, x, timestep, context, context_mask, action, **kwargs):
+        del timestep, action, kwargs
+        batch_size, channels, latent_steps, height, width = x.shape
+        tokens = x.permute(0, 2, 3, 4, 1).reshape(
+            batch_size, latent_steps * height * width, channels
+        )
+        tokens = tokens + self.bias
+        video_seq_len = tokens.shape[1]
+        return {
+            "tokens": tokens,
+            "freqs": torch.zeros(
+                video_seq_len,
+                1,
+                1,
+                device=x.device,
+                dtype=torch.complex64,
+            ),
+            "t_mod": torch.zeros(
+                batch_size, 6, channels, device=x.device, dtype=x.dtype
+            ),
+            "context": context,
+            "context_mask": context_mask[:, None, :].expand(
+                -1, video_seq_len, -1
+            ),
+            "meta": {
+                "tokens_per_frame": height * width,
+                "latent_shape": (channels, latent_steps, height, width),
+            },
+        }
+
+    def build_video_to_video_mask(self, video_seq_len, device, **kwargs):
+        del kwargs
+        return torch.ones(
+            video_seq_len, video_seq_len, dtype=torch.bool, device=device
+        )
+
+    def post_dit(self, tokens, pre):
+        channels, latent_steps, height, width = pre["meta"]["latent_shape"]
+        return tokens.reshape(
+            tokens.shape[0], latent_steps, height, width, channels
+        ).permute(0, 4, 1, 2, 3)
+
+
+class _DummyJointActionExpert(torch.nn.Module):
+    def __init__(self, horizon: int = 64) -> None:
+        super().__init__()
+        self.bias = torch.nn.Parameter(torch.tensor(2.0))
+        self.register_buffer(
+            "freqs", torch.zeros(horizon, 1, 1, dtype=torch.complex64)
+        )
+
+    def pre_dit(
+        self, action_tokens, timestep, context, context_mask, **kwargs
+    ):
+        del timestep, kwargs
+        tokens = action_tokens + self.bias
+        return {
+            "tokens": tokens,
+            "freqs": self.freqs[: tokens.shape[1]],
+            "t_mod": torch.zeros(
+                tokens.shape[0],
+                6,
+                tokens.shape[2],
+                device=tokens.device,
+                dtype=tokens.dtype,
+            ),
+            "context": context,
+            "context_mask": context_mask[:, None, :].expand(
+                -1, tokens.shape[1], -1
+            ),
+        }
+
+    def post_dit(self, tokens, pre):
+        del pre
+        return tokens
+
+
+class _DummyJointMoT(torch.nn.Module):
+    def forward(self, embeds_all, **kwargs):
+        del kwargs
+        return embeds_all
+
+
+class _DummyJointVAE(torch.nn.Module):
+    temporal_downsample_factor = 4
+
+
+class _DummyJointVideoScheduler:
+    def sample_training_t(self, batch_size, device, dtype):
+        return torch.full((batch_size,), 500.0, device=device, dtype=dtype)
+
+    def add_noise(self, original_samples, noise, timestep):
+        del original_samples, timestep
+        return noise
+
+    def training_target(self, original_samples, noise, timestep):
+        del original_samples, timestep
+        return noise
+
+    def training_weight(self, timestep):
+        return torch.ones_like(timestep)
+
+
+def _joint_training_inputs(latent_steps: int = 5) -> dict[str, torch.Tensor | bool]:
+    return {
+        "input_latents": torch.zeros(1, 1, latent_steps, 1, 1),
+        "first_frame_latents": torch.zeros(1, 1, 1, 1, 1),
+        "fuse_vae_embedding_in_latents": True,
+        "context": torch.zeros(1, 2, 1),
+        "context_mask": torch.ones(1, 2, dtype=torch.bool),
+        "action": torch.zeros(1, 64, 1),
+        "action_is_pad": torch.zeros(1, 64, dtype=torch.bool),
+        "image_is_pad": torch.zeros(1, 17, dtype=torch.bool),
+    }
+
+
+def _joint_training_shell(
+    inputs: dict[str, torch.Tensor | bool],
+    attention_mode: str = "first_frame_causal",
+) -> FastWAM:
+    model = _training_shell(num_slots=4, chunk_size=16)
+    model.streaming_action_enabled = True
+    model.video_expert = _DummyJointVideoExpert(attention_mode=attention_mode)
+    model.action_expert = _DummyJointActionExpert(horizon=64)
+    model.mot = _DummyJointMoT()
+    model.vae = _DummyJointVAE()
+    model.train_video_scheduler = _DummyJointVideoScheduler()
+    model.loss_lambda_video = 1.0
+    model.loss_lambda_action = 1.0
+    model.build_inputs = lambda sample, tiled=False, **kwargs: inputs
+    return model
+
+
+def test_streaming_joint_training_backpropagates_video_and_action_losses() -> None:
+    torch.manual_seed(4)
+    inputs = _joint_training_inputs()
+    assert inputs["input_latents"].shape[2] == 5
+    assert inputs["image_is_pad"].shape[1] == 17
+    assert inputs["action"].shape[1] == 64
+    model = _joint_training_shell(inputs)
+
+    loss, metrics = model.training_loss_streaming_action(sample={})
+
+    assert loss.item() > 0
+    assert metrics["loss_video"] > 0
+    assert metrics["loss_action"] > 0
+    loss.backward()
+    assert model.video_expert.bias.grad is not None
+    assert model.video_expert.bias.grad.abs().item() > 0
+    assert model.action_expert.bias.grad is not None
+    assert model.action_expert.bias.grad.abs().item() > 0
+
+
+def test_streaming_joint_training_rejects_misaligned_video_latent_steps() -> None:
+    model = _joint_training_shell(_joint_training_inputs(latent_steps=4))
+
+    try:
+        model.training_loss_streaming_action(sample={})
+    except ValueError as exc:
+        assert "future_video_latent_steps=3" in str(exc)
+        assert "num_slots=4" in str(exc)
+    else:
+        raise AssertionError("Expected misaligned future video latents to be rejected.")
+
+
+def test_streaming_joint_training_requires_first_frame_causal_video() -> None:
+    model = _joint_training_shell(
+        _joint_training_inputs(), attention_mode="bidirectional"
+    )
+
+    try:
+        model.training_loss_streaming_action(sample={})
+    except ValueError as exc:
+        assert "video_attention_mask_mode='first_frame_causal'" in str(exc)
+    else:
+        raise AssertionError("Expected non-causal video attention to be rejected.")
+
+
+def test_streaming_joint_training_unfreezes_full_dit_but_not_vae() -> None:
+    class _TrainModeShell(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dit = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.Linear(2, 2),
+            )
+            self.vae = torch.nn.Linear(2, 2)
+            self.proprio_encoder = torch.nn.Linear(2, 2)
+
+    model = _TrainModeShell()
+    model.train()
+    Wan22Trainer._apply_dit_only_train_mode(model)
+
+    assert model.dit.training
+    assert all(parameter.requires_grad for parameter in model.dit.parameters())
+    assert not model.vae.training
+    assert all(not parameter.requires_grad for parameter in model.vae.parameters())
+    assert model.proprio_encoder.training
+    assert all(
+        parameter.requires_grad for parameter in model.proprio_encoder.parameters()
+    )
 
 
 def _inference_shell(num_slots: int = 4, chunk_size: int = 2) -> FastWAM:

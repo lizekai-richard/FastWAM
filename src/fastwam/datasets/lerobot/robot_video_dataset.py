@@ -42,7 +42,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
-        action_horizon: Optional[int] = None,
     ):
         if (
             isinstance(num_frames, bool)
@@ -52,16 +51,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "`num_frames` must be an integer greater than 1, "
                 f"got {num_frames!r}"
-            )
-        if action_horizon is None:
-            action_horizon = num_frames - 1
-        if (
-            isinstance(action_horizon, bool)
-            or not isinstance(action_horizon, int)
-            or action_horizon <= 0
-        ):
-            raise ValueError(
-                f"`action_horizon` must be a positive integer, got {action_horizon!r}"
             )
         if (
             isinstance(action_video_freq_ratio, bool)
@@ -77,14 +66,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
-            action_size=action_horizon,
+            action_size=num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
     
         self.num_frames = num_frames
-        self.action_horizon = action_horizon
         self.action_video_freq_ratio = action_video_freq_ratio
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
@@ -227,10 +215,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
-        # LeRobot samples observations and actions with independent horizons.
-        # Video/proprio remain based on `num_frames`, while action can extend to
-        # a longer streaming buffer horizon (for example, 4 slots x 16 = 64).
-        action = sample["action"]  # [action_horizon, action_dim]
+        # A T-frame observation/video window has T-1 aligned future actions.
+        action = sample["action"]  # [num_frames-1, action_dim]
         proprio = sample["proprio"][:-1, :]  # [num_frames-1, state_dim]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")

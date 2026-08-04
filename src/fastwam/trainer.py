@@ -294,18 +294,10 @@ class Wan22Trainer:
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
-        if bool(getattr(model, "streaming_action_enabled", False)):
-            # The streaming objective consumes cached video K/V but has no
-            # video reconstruction head. Keep the pretrained video prefix
-            # frozen so distributed training has no unused trainable video
-            # parameters (the final video post-block/head are intentionally
-            # absent from this action-only graph).
-            model.dit.requires_grad_(False)
-            model.video_expert.eval()
-            model.action_expert.train()
-            model.action_expert.requires_grad_(True)
-        else:
-            model.dit.requires_grad_(True)
+        # Both legacy and streaming objectives optimize the aligned video and
+        # action branches. VAE/text components remain frozen by the model-wide
+        # freeze above; MoT, VideoDiT, and ActionDiT are trainable.
+        model.dit.requires_grad_(True)
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
@@ -488,9 +480,9 @@ class Wan22Trainer:
         pred_action = pred.get("action", None)
         if bool(getattr(model, "streaming_action_enabled", False)):
             # `model.infer()` remains the legacy joint video rollout used for
-            # frozen-video diagnostics. Its one-shot action path does not match
-            # the rolling streaming objective, so do not publish a misleading
-            # action L1/L2 metric; streaming val_loss remains available here and
+            # video diagnostics. Its one-shot action path does not match the
+            # rolling streaming objective, so do not publish a misleading action
+            # L1/L2 metric; streaming val_loss remains available here and
             # closed-loop policy evaluation measures actual action quality.
             pred_action = None
 

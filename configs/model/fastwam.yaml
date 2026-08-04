@@ -55,7 +55,8 @@ action_scheduler:
   num_train_timesteps: 1000
 
 # FlashVLA-style streaming action decoding is opt-in. Four rolling-buffer
-# slots, each containing a 16-action chunk, give a 64-action horizon. Enabling
+# slots, each containing a 16-action chunk, give a 64-action horizon. Training
+# overlays data.num_frames=65 to keep video/action supervision aligned. Enabling
 # it requires a streaming-trained checkpoint and caller-owned per-episode state.
 streaming_action:
   enabled: false
@@ -73,4 +74,5 @@ torch_compile_dynamic: null
 torch_compile_disable_cudagraphs: null
 
 loss:
+  lambda_video: 1.0
   lambda_action: 1.0

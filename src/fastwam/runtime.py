@@ -355,20 +355,8 @@ def create_fastwam_idm(
     )
 
 
-def build_datasets(data_cfg: DictConfig, action_horizon: int | None = None):
-    dataset_kwargs = {}
-    if action_horizon is not None:
-        if (
-            isinstance(action_horizon, bool)
-            or not isinstance(action_horizon, int)
-            or action_horizon <= 0
-        ):
-            raise ValueError(
-                f"`action_horizon` must be a positive integer, got {action_horizon!r}"
-            )
-        dataset_kwargs["action_horizon"] = action_horizon
-
-    train_ds = instantiate(data_cfg.train, **dataset_kwargs)
+def build_datasets(data_cfg: DictConfig):
+    train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
         val_ds = train_ds
     else:
@@ -377,12 +365,60 @@ def build_datasets(data_cfg: DictConfig, action_horizon: int | None = None):
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
         pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
         logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-        val_ds = instantiate(
-            data_cfg.val,
-            pretrained_norm_stats=pretrained_norm_stats,
-            **dataset_kwargs,
-        )
+        val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
     return train_ds, val_ds
+
+
+def _configure_streaming_training_data(cfg: DictConfig):
+    """Align the supervised video/action window with the streaming buffer."""
+    streaming_cfg = cfg.model.get("streaming_action")
+    if streaming_cfg is None or not bool(streaming_cfg.get("enabled", False)):
+        return None
+
+    num_slots = int(streaming_cfg.get("num_slots", 4))
+    chunk_size = int(streaming_cfg.get("chunk_size", 16))
+    if num_slots <= 0 or chunk_size <= 0:
+        raise ValueError(
+            "Streaming action requires positive num_slots and chunk_size, got "
+            f"{num_slots} and {chunk_size}."
+        )
+    action_horizon = num_slots * chunk_size
+    num_frames = action_horizon + 1
+
+    split_names = []
+    for split_name in ("train", "val"):
+        split_cfg = cfg.data.get(split_name)
+        if split_cfg is None:
+            continue
+        if "num_frames" not in split_cfg:
+            raise ValueError(
+                "Streaming action training requires an aligned video dataset with "
+                f"data.{split_name}.num_frames."
+            )
+        split_cfg.num_frames = num_frames
+        split_names.append(split_name)
+
+    for split_name in split_names:
+        split_cfg = cfg.data[split_name]
+        processor_cfg = split_cfg.get("processor")
+        if processor_cfg is None:
+            continue
+        if bool(processor_cfg.get("use_stepwise_action_norm", False)):
+            raise ValueError(
+                "Streaming action currently requires global action normalization "
+                "(`use_stepwise_action_norm=false`): the rolling buffer emits "
+                f"one chunk at a time, but data.{split_name}.processor enables "
+                "stepwise normalization."
+            )
+        if "num_obs_steps" in processor_cfg:
+            processor_cfg.num_obs_steps = num_frames
+
+    return {
+        "num_slots": num_slots,
+        "chunk_size": chunk_size,
+        "action_horizon": action_horizon,
+        "num_frames": num_frames,
+    }
 
 
 def _resolve_train_device() -> str:
@@ -403,6 +439,7 @@ def run_training(cfg: DictConfig):
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
     )
     misc.register_work_dir(cfg.output_dir)
+    streaming_layout = _configure_streaming_training_data(cfg)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
         OmegaConf.save(config_payload, f)
@@ -411,34 +448,99 @@ def run_training(cfg: DictConfig):
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    action_horizon = None
-    if bool(getattr(model, "streaming_action_enabled", False)):
-        num_slots = int(model.streaming_action_num_slots)
-        chunk_size = int(model.streaming_action_chunk_size)
-        action_horizon = num_slots * chunk_size
+    if streaming_layout is not None:
+        if not bool(getattr(model, "streaming_action_enabled", False)):
+            raise RuntimeError(
+                "The resolved config enables streaming action, but the instantiated "
+                "model reports streaming_action_enabled=false."
+            )
+        model_layout = {
+            "num_slots": int(model.streaming_action_num_slots),
+            "chunk_size": int(model.streaming_action_chunk_size),
+        }
+        if model_layout != {
+            "num_slots": streaming_layout["num_slots"],
+            "chunk_size": streaming_layout["chunk_size"],
+        }:
+            raise RuntimeError(
+                "Resolved streaming model/data layouts disagree: "
+                f"model={model_layout}, data={streaming_layout}."
+            )
+        temporal_factor = int(model.vae.temporal_downsample_factor)
+        if temporal_factor <= 0:
+            raise ValueError(
+                "Streaming video/action training requires a positive VAE temporal "
+                f"downsample factor, got {temporal_factor}."
+            )
+        sampled_video_frames = None
+        latent_video_steps = None
         for split_name in ("train", "val"):
             split_cfg = cfg.data.get(split_name)
             if split_cfg is None:
                 continue
-            processor_cfg = split_cfg.get("processor")
-            if (
-                processor_cfg is not None
-                and bool(processor_cfg.get("use_stepwise_action_norm", False))
+            if "action_video_freq_ratio" not in split_cfg:
+                raise ValueError(
+                    "Streaming video/action training requires "
+                    f"data.{split_name}.action_video_freq_ratio."
+                )
+            video_stride = int(split_cfg.action_video_freq_ratio)
+            if video_stride <= 0:
+                raise ValueError(
+                    "Streaming video/action training requires a positive "
+                    f"data.{split_name}.action_video_freq_ratio, got {video_stride}."
+                )
+            expected_chunk_size = video_stride * temporal_factor
+            if streaming_layout["chunk_size"] != expected_chunk_size:
+                raise ValueError(
+                    "Each streaming action chunk must align with one future video "
+                    "latent: "
+                    f"chunk_size={streaming_layout['chunk_size']}, "
+                    f"action_video_freq_ratio={video_stride}, "
+                    f"vae_temporal_downsample_factor={temporal_factor}, "
+                    f"expected_chunk_size={expected_chunk_size}."
+                )
+            num_video_transitions = streaming_layout["action_horizon"] // video_stride
+            split_sampled_video_frames = num_video_transitions + 1
+            if num_video_transitions % temporal_factor != 0:
+                raise ValueError(
+                    "Sampled video transitions must be divisible by the VAE temporal "
+                    "downsample factor: "
+                    f"transitions={num_video_transitions}, factor={temporal_factor}."
+                )
+            split_latent_video_steps = num_video_transitions // temporal_factor + 1
+            expected_latent_video_steps = streaming_layout["num_slots"] + 1
+            if split_latent_video_steps != expected_latent_video_steps:
+                raise ValueError(
+                    "Streaming video/action training requires one future video latent "
+                    "per action slot: "
+                    f"latent_video_steps={split_latent_video_steps}, "
+                    f"expected={expected_latent_video_steps}."
+                )
+            if sampled_video_frames is None:
+                sampled_video_frames = split_sampled_video_frames
+                latent_video_steps = split_latent_video_steps
+            elif (
+                sampled_video_frames != split_sampled_video_frames
+                or latent_video_steps != split_latent_video_steps
             ):
                 raise ValueError(
-                    "Streaming action currently requires global action normalization "
-                    "(`use_stepwise_action_norm=false`): the rolling buffer emits "
-                    f"one chunk at a time, but data.{split_name}.processor enables "
-                    "stepwise normalization."
+                    "Train and validation streaming video layouts must match, got "
+                    f"{sampled_video_frames}/{latent_video_steps} and "
+                    f"{split_sampled_video_frames}/{split_latent_video_steps}."
                 )
         logger.info(
-            "Streaming action training: overriding dataset action horizon to "
-            "%d (%d slots x %d actions)",
-            action_horizon,
-            num_slots,
-            chunk_size,
+            "Streaming action training: %d raw frames / %d actions -> %d sampled "
+            "video frames -> %d video latents (%d slots x %d actions; VAE temporal "
+            "factor %d)",
+            streaming_layout["num_frames"],
+            streaming_layout["action_horizon"],
+            sampled_video_frames,
+            latent_video_steps,
+            streaming_layout["num_slots"],
+            streaming_layout["chunk_size"],
+            temporal_factor,
         )
-    train_ds, val_ds = build_datasets(cfg.data, action_horizon=action_horizon)
+    train_ds, val_ds = build_datasets(cfg.data)
 
     trainer = Wan22Trainer(
         cfg=cfg,

@@ -1,5 +1,5 @@
-from numbers import Integral
 from pathlib import Path
+from numbers import Integral
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
 
 import torch
@@ -39,24 +39,16 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
         assert past_obs_size == 0
-        if (
-            isinstance(action_size, bool)
-            or not isinstance(action_size, Integral)
-            or action_size <= 0
-        ):
+        for name, value in (("obs_size", obs_size), ("action_size", action_size)):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+                raise ValueError(
+                    f"`{name}` must be a positive integer, got {value!r}."
+                )
+        if action_size != obs_size - 1:
             raise ValueError(
-                f"`action_size` must be a positive integer, got {action_size!r}"
+                "Aligned video/action sampling requires "
+                f"action_size == obs_size - 1, got {action_size} and {obs_size}."
             )
-        if (
-            isinstance(obs_size, bool)
-            or not isinstance(obs_size, Integral)
-            or obs_size <= 0
-        ):
-            raise ValueError(
-                f"`obs_size` must be a positive integer, got {obs_size!r}"
-            )
-        action_size = int(action_size)
-        obs_size = int(obs_size)
         
         self.dataset_dirs = dataset_dirs
         self.shape_meta = shape_meta

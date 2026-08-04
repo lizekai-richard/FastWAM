@@ -38,6 +38,8 @@ from .datasets.compute_stats import aggregate_stats, compute_episode_stats
 from .datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
+    DEFAULT_PARQUET_PATH,
+    DEFAULT_VIDEO_PATH,
     INFO_PATH,
     TASKS_PATH,
     _validate_feature_names,
@@ -140,13 +142,74 @@ class LeRobotDatasetMetadata:
 
     def get_data_file_path(self, ep_index: int) -> Path:
         ep_chunk = self.get_episode_chunk(ep_index)
-        fpath = self.data_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
+        try:
+            fpath = self.data_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
+        except KeyError as error:
+            return self._get_v3_compatible_episode_path(
+                template=self.data_path,
+                compatibility_template=DEFAULT_PARQUET_PATH,
+                ep_index=ep_index,
+                episode_chunk=ep_chunk,
+                missing_placeholder=error.args[0],
+            )
         return Path(fpath)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
         ep_chunk = self.get_episode_chunk(ep_index)
-        fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
+        try:
+            fpath = self.video_path.format(
+                episode_chunk=ep_chunk,
+                video_key=vid_key,
+                episode_index=ep_index,
+            )
+        except KeyError as error:
+            return self._get_v3_compatible_episode_path(
+                template=self.video_path,
+                compatibility_template=DEFAULT_VIDEO_PATH,
+                ep_index=ep_index,
+                episode_chunk=ep_chunk,
+                video_key=vid_key,
+                missing_placeholder=error.args[0],
+            )
         return Path(fpath)
+
+    def _get_v3_compatible_episode_path(
+        self,
+        *,
+        template: str,
+        compatibility_template: str,
+        ep_index: int,
+        episode_chunk: int,
+        missing_placeholder: str,
+        video_key: str | None = None,
+    ) -> Path:
+        """Resolve an existing per-episode compatibility file for a v3 dataset.
+
+        LeRobot v3 metadata describes consolidated files using ``chunk_index`` and
+        ``file_index``.  An episode index alone does not determine ``file_index``.
+        Some converted datasets retain v2-style per-episode files alongside the
+        consolidated files; those files are safe to use because their path is a
+        direct function of the episode index.
+        """
+        if self._version < packaging.version.parse("v3.0"):
+            raise KeyError(missing_placeholder)
+
+        format_kwargs = {
+            "episode_chunk": episode_chunk,
+            "episode_index": ep_index,
+        }
+        if video_key is not None:
+            format_kwargs["video_key"] = video_key
+        compatibility_path = Path(compatibility_template.format(**format_kwargs))
+        if (self.root / compatibility_path).is_file():
+            return compatibility_path
+
+        raise ValueError(
+            f"Cannot resolve LeRobot {self._version} path template {template!r} "
+            f"for episode {ep_index}: placeholder {missing_placeholder!r} requires "
+            "v3 file-index metadata. The per-episode compatibility file "
+            f"{str(compatibility_path)!r} does not exist; refusing to infer file_index."
+        )
 
     def get_episode_chunk(self, ep_index: int) -> int:
         return ep_index // self.chunks_size

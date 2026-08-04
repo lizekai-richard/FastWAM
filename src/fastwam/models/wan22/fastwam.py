@@ -800,55 +800,76 @@ class FastWAM(torch.nn.Module):
         return mask
 
     def training_loss_streaming_action(self, sample, tiled: bool = False):
-        """FlashVLA-style action training with a shared clean video prefix.
+        """Train aligned video diffusion and FlashVLA-style action streaming.
 
-        The runtime-derived streaming horizon is expanded in-memory into all
-        ``N`` padded cold-start configurations. The video branch sees only the
-        clean first frame, exactly as base FastWAM action inference does.
+        The full video window keeps the standard FastWAM diffusion objective.
+        The aligned action horizon is expanded into all ``N`` padded streaming
+        configurations, while action attention remains limited to the clean
+        first video frame so future ground-truth video cannot leak into policy
+        prediction.
         """
-        inputs = self.build_inputs(sample, tiled=tiled, first_frame_only=True)
+        inputs = self.build_inputs(sample, tiled=tiled)
+        input_latents = inputs["input_latents"]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
         action = inputs["action"]
+        image_is_pad = inputs["image_is_pad"]
+
+        if (
+            str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+            != "first_frame_causal"
+        ):
+            raise ValueError(
+                "Streaming video/action training requires "
+                "`video_attention_mask_mode='first_frame_causal'` so the clean "
+                "prefix cannot absorb future ground-truth video tokens."
+            )
+        future_video_latent_steps = int(input_latents.shape[2]) - 1
+        if future_video_latent_steps != self.streaming_action_num_slots:
+            raise ValueError(
+                "Streaming video/action alignment requires one future video latent "
+                "per action-buffer slot: got "
+                f"future_video_latent_steps={future_video_latent_steps}, "
+                f"num_slots={self.streaming_action_num_slots}."
+            )
+        if inputs["first_frame_latents"] is None:
+            raise ValueError(
+                "Streaming video/action training requires a clean first-frame latent "
+                "prefix (`fuse_vae_embedding_in_latents=true`)."
+            )
+
         stream = self._build_streaming_training_batch(
             action=action,
             action_is_pad=inputs["action_is_pad"],
         )
 
-        first_frame_latents = inputs["input_latents"][:, :, :1]
-        timestep_video = torch.zeros(
-            (first_frame_latents.shape[0],),
-            dtype=first_frame_latents.dtype,
-            device=first_frame_latents.device,
+        batch_size = input_latents.shape[0]
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=input_latents.device,
+            dtype=input_latents.dtype,
         )
-        # Streaming fine-tuning freezes the pretrained video prefix. Besides
-        # avoiding unused trainable video-head parameters, no-grad keeps the
-        # shared prefix cache materially smaller than N duplicated branches.
-        with torch.no_grad():
-            video_pre = self.video_expert.pre_dit(
-                x=first_frame_latents,
-                timestep=timestep_video,
-                context=context,
-                context_mask=context_mask,
-                action=None,
-                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-            )
-            video_seq_len = int(video_pre["tokens"].shape[1])
-            video_attention_mask = self.video_expert.build_video_to_video_mask(
-                video_seq_len=video_seq_len,
-                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-                device=video_pre["tokens"].device,
-            )
-            video_kv_cache = self.mot.prefill_video_cache(
-                video_tokens=video_pre["tokens"],
-                video_freqs=video_pre["freqs"],
-                video_t_mod=video_pre["t_mod"],
-                video_context_payload={
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
-                },
-                video_attention_mask=video_attention_mask,
-            )
+        latents_video = self.train_video_scheduler.add_noise(
+            input_latents,
+            noise_video,
+            timestep_video,
+        )
+        target_video = self.train_video_scheduler.training_target(
+            input_latents,
+            noise_video,
+            timestep_video,
+        )
+        latents_video[:, :, :1] = inputs["first_frame_latents"]
+
+        video_pre = self.video_expert.pre_dit(
+            x=latents_video,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+        )
 
         action_pre = self.action_expert.pre_dit(
             action_tokens=stream["noisy"],
@@ -868,26 +889,55 @@ class FastWAM(torch.nn.Module):
         action_attention_mask = self._build_streaming_training_action_mask(
             valid=stream["valid"]
         )
+        video_tokens = video_pre["tokens"]
+        action_tokens = action_pre["tokens"]
         attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_seq_len,
-            action_seq_len=action_pre["tokens"].shape[1],
+            video_seq_len=video_tokens.shape[1],
+            action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_pre["tokens"].device,
+            device=video_tokens.device,
             action_attention_mask=action_attention_mask,
         )
-        action_tokens = self.mot.forward_action_with_video_cache(
-            action_tokens=action_pre["tokens"],
-            action_freqs=action_pre["freqs"],
-            action_t_mod=action_pre["t_mod"],
-            action_context_payload={
-                "context": action_pre["context"],
-                "mask": action_pre["context_mask"],
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_tokens,
             },
-            video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
-            video_seq_len=video_seq_len,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
         )
-        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+
+        pred_video = pred_video[:, :, 1:]
+        target_video = target_video[:, :, 1:]
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=False,
+        )
+        video_weight = self.train_video_scheduler.training_weight(
+            timestep_video
+        ).to(loss_video_per_sample.device, dtype=loss_video_per_sample.dtype)
+        loss_video = (loss_video_per_sample * video_weight).mean()
 
         token_loss = F.mse_loss(
             pred_action.float(), stream["target"].float(), reduction="none"
@@ -899,9 +949,12 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid_float.sum(dim=1).clamp(min=1.0)
         loss_per_sample = (token_loss * token_weight * valid_float).sum(dim=1) / valid_sum
         loss_action = loss_per_sample.mean()
-        loss_total = self.loss_lambda_action * loss_action
+        loss_total = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+        )
         return loss_total, {
-            "loss_video": 0.0,
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_streaming_action": self.loss_lambda_action
             * float(loss_action.detach().item()),
@@ -2172,7 +2225,7 @@ class FastWAM(torch.nn.Module):
         return {
             "enabled": self.streaming_action_enabled,
             "objective": (
-                "flashvla_action_streaming_v1"
+                "flashvla_video_action_streaming_v2"
                 if self.streaming_action_enabled
                 else "legacy"
             ),
@@ -2186,6 +2239,15 @@ class FastWAM(torch.nn.Module):
                 if self.streaming_action_enabled
                 else None
             ),
+            "video_train_shift": float(self.train_video_scheduler.shift),
+            "video_num_train_timesteps": int(
+                self.train_video_scheduler.num_train_timesteps
+            ),
+            "video_temporal_downsample_factor": int(
+                self.vae.temporal_downsample_factor
+            ),
+            "loss_lambda_video": self.loss_lambda_video,
+            "loss_lambda_action": self.loss_lambda_action,
             "action_train_shift": float(self.train_action_scheduler.shift),
             "action_infer_shift": float(self.infer_action_scheduler.shift),
             "action_num_train_timesteps": int(
@@ -2232,7 +2294,7 @@ class FastWAM(torch.nn.Module):
             and streaming_metadata.get("enabled", False)
         )
         if checkpoint_is_streaming:
-            expected_objective = "flashvla_action_streaming_v1"
+            expected_objective = "flashvla_video_action_streaming_v2"
             if streaming_metadata.get("objective") != expected_objective:
                 raise ValueError(
                     "Unsupported streaming checkpoint objective: "
@@ -2242,6 +2304,15 @@ class FastWAM(torch.nn.Module):
                 expected_values = {
                     "num_slots": self.streaming_action_num_slots,
                     "chunk_size": self.streaming_action_chunk_size,
+                    "video_train_shift": float(self.train_video_scheduler.shift),
+                    "video_num_train_timesteps": int(
+                        self.train_video_scheduler.num_train_timesteps
+                    ),
+                    "video_temporal_downsample_factor": int(
+                        self.vae.temporal_downsample_factor
+                    ),
+                    "loss_lambda_video": self.loss_lambda_video,
+                    "loss_lambda_action": self.loss_lambda_action,
                     "action_train_shift": float(self.train_action_scheduler.shift),
                     "action_infer_shift": float(self.infer_action_scheduler.shift),
                     "action_num_train_timesteps": int(

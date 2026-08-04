@@ -86,9 +86,10 @@ the same slot schedule used at inference. A latency run cannot establish task
 quality or checkpoint compatibility; closed-loop RoboTwin/LIBERO evaluation is
 required before deployment.
 
-New checkpoints record the objective version, `num_slots`, `chunk_size`, the
-training/inference shifts, and action timestep scale. Loading checks those
-fields against an enabled streaming config. RoboTwin deployment additionally
+New checkpoints record the joint video/action objective version, `num_slots`,
+`chunk_size`, video/action scheduler fields, VAE temporal factor, and loss
+weights. Loading checks those fields against an enabled streaming config.
+RoboTwin deployment additionally
 rejects a legacy checkpoint in streaming mode and rejects a streaming-trained
 checkpoint when the runtime switch was accidentally left off. The latency
 benchmark remains able to run a legacy checkpoint for implementation timing
@@ -99,25 +100,28 @@ Accelerate full-state resumes record and validate the same contract in
 directories without that metadata cannot resume a streaming run; use their
 `.pt` weights as initialization instead.
 
-The first integration stage intentionally freezes the pretrained video expert
-and trains ActionDiT plus the optional proprio encoder. Streaming training uses
-the clean first-frame video KV prefix only and has no video reconstruction
-objective; freezing avoids unused trainable video-head parameters in DDP/ZeRO
-while preserving the existing visual representation. Jointly adapting the
-video prefix would require an explicit auxiliary video loss and is outside this
-base FastWAM action-streaming stage.
+Streaming training retains FastWAM's full video diffusion objective and trains
+both VideoDiT and ActionDiT through one joint MoT forward. The video branch uses
+the standard per-sample FastWAM flow timestep; the action branch uses the
+FlashVLA-style staggered slot timesteps and block-diagonal branch mask. Action
+queries can attend only to the clean first-frame video tokens, and
+`video_attention_mask_mode=first_frame_causal` prevents that prefix from
+absorbing future ground-truth video information indirectly.
 
 Trainer validation continues to render the legacy joint video rollout as a
-frozen-video diagnostic, but suppresses its action L1/L2 because that one-shot
-action path is not the streaming policy. Use streaming validation loss and
+video diagnostic, but suppresses its action L1/L2 because that one-shot action
+path is not the streaming policy. Use the aligned streaming validation loss and
 closed-loop evaluation for action quality.
 
-The regular data configs can keep their existing video observation window.
-When streaming training is enabled, the runtime requests the independent
-64-step action horizon required by `num_slots * chunk_size`; the dataset still
-uses `num_frames` to sample video/proprio observations. This avoids loading a
-65-frame video when the streaming objective consumes only its clean first
-frame. Current global normalization statistics remain reusable. This streaming
+When streaming training is enabled, the runtime overlays `num_frames=65` on
+train and validation data so 64 future actions remain paired with observations
+from `t0` through `t64`; legacy training keeps its configured 33-frame window.
+With `action_video_freq_ratio=4`, those 65 raw observations produce 17 model
+video frames. The Wan VAE temporal factor of 4 produces five latent frames:
+one clean prefix plus four future latent transitions, exactly one per
+16-action buffer slot. The runtime and loss both validate this mapping.
+
+Current global normalization statistics remain reusable. This streaming
 integration requires `use_stepwise_action_norm=false`: a 64-position stepwise
 normalizer cannot directly denormalize the emitted 16-action chunk.
 
